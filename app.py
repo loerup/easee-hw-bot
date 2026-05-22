@@ -159,6 +159,20 @@ Rules:
 
 
 def parse_intent(text: str) -> dict:
+    # Fast keyword pre-check — catches simple one-word commands without LLM
+    lowered = text.lower().strip()
+    if lowered in ("help", "?", "commands"):
+        return {"action": "help"}
+    if lowered in ("status", "list", "overview", "what's checked out", "whats checked out"):
+        return {"action": "status"}
+    if lowered.startswith("checkout ") or lowered.startswith("check out "):
+        return {"action": "checkout", "part_name": text.split(" ", 1)[1].strip(),
+                "part_number": None, "onshape_link": None, "notes": None}
+    if lowered.startswith("checkin ") or lowered.startswith("check in "):
+        return {"action": "checkin", "part_name": text.split(" ", 1)[1].strip(),
+                "part_number": None, "onshape_link": None, "notes": None}
+
+    # Fall back to LLM parsing for natural language
     try:
         resp = anthropic_client.messages.create(
             model="claude-haiku-4-5-20251001",
