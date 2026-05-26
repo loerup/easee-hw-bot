@@ -149,10 +149,10 @@ def search_by_part_number(part_number: str) -> list[dict]:
         elems = _get_elements(did, wid)
         for elem in elems:
             # API returns "Part Studio" (with space)
-            if elem.get("type", "").replace(" ", "").upper() == "PARTSTUDIO":
+            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
                 parts = _get_parts(did, wid, elem["id"])
                 for p in parts:
-                    pnum = p.get("partNumber", "")
+                    pnum = p.get("partNumber") or ""
                     if pnum.lower() == part_number.lower():
                         config = p.get("configuration") or ""
                         results.append({
@@ -422,7 +422,7 @@ def detect_shared_import(did: str, wid: str, eid: str, blob_eid: str) -> bool:
     features = resp.json().get("features", [])
     import_features = [
         f for f in features
-        if f.get("featureType", "").lower() in ("import", "importforeign")
+        if (f.get("featureType") or "").lower() in ("import", "importforeign")
     ]
     # Count how many Import features reference our blob element
     refs = 0
