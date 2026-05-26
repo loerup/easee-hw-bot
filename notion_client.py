@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 NOTION_TOKEN  = os.environ.get("NOTION_TOKEN", "")
 NOTION_BASE   = "https://api.notion.com/v1"
-DB_ID         = "366db557-b8e3-803c-8c38-000bdc54767d"
+DB_ID         = "366db557-b8e3-8017-ac87-e2a9923b8b18"
 NOTION_VER    = "2022-06-28"
 
 
