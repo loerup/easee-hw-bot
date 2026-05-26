@@ -120,14 +120,15 @@ def get_part(page_id: str) -> dict | None:
 
 # ── State updates ─────────────────────────────────────────────────────────────
 
-def set_checked_out(page_id: str, notion_user_id: str) -> bool:
-    """Mark a part as Checked Out by the given Notion user."""
-    body = {
-        "properties": {
-            "Checked In / Out": {"select": {"name": "Checked Out"}},
-            "Who checked out?": {"people": [{"object": "user", "id": notion_user_id}]},
-        }
+def set_checked_out(page_id: str, notion_user_id: str | None = None) -> bool:
+    """Mark a part as Checked Out. Optionally records the Notion user."""
+    props = {
+        "Checked In / Out": {"select": {"name": "Checked Out"}},
     }
+    if notion_user_id:
+        props["Who checked out?"] = {"people": [{"object": "user", "id": notion_user_id}]}
+
+    body = {"properties": props}
     resp = requests.patch(f"{NOTION_BASE}/pages/{page_id}", headers=_headers(), json=body)
     if resp.status_code != 200:
         logger.error("set_checked_out failed: %s — %s", resp.status_code, resp.text[:200])
