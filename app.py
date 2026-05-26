@@ -535,12 +535,11 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
         say(text=f"⚠️ File upload failed: `{e}`\nBranch is ready: {branch_url}",
             thread_ts=thread_ts)
 
-    # ⑥ Update Notion
+    # ⑥ Update Notion — always update status; resolve person if possible
     notion_user_id = nc.resolve_user_by_email(user_email) if user_email else None
-    if notion_user_id:
-        nc.set_checked_out(page_id, notion_user_id)
-    else:
-        logger.warning("Could not resolve Notion user for %s", user_email)
+    if not notion_user_id:
+        logger.warning("Could not resolve Notion user for %s — updating status only", user_email)
+    nc.set_checked_out(page_id, notion_user_id)
 
     # ⑦ Find blob element for check-in later
     blob_eid  = None
