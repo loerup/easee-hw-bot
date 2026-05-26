@@ -546,8 +546,8 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
     blob_name = None
     elements  = oc._get_elements(did, branch_id)
     for elem in elements:
-        etype = elem.get("type", "").upper()
-        ename = elem.get("name", "")
+        etype = (elem.get("type") or "").upper()
+        ename = elem.get("name") or ""
         if etype in ("BLOB", "BLOBMODEL") and part_number.lower() in ename.lower():
             blob_eid  = elem["id"]
             blob_name = ename
@@ -617,15 +617,15 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
     elements = oc._get_elements(did, branch_id)
     ps_eid_actual = None
     for elem in elements:
-        etype = elem.get("type", "").replace(" ", "").upper()
-        ename = elem.get("name", "")
+        etype = (elem.get("type") or "").replace(" ", "").upper()
+        ename = elem.get("name") or ""
         if etype == "PARTSTUDIO" and part_number[:4].lower() in ename.lower():
             ps_eid_actual = elem["id"]
             break
     # fallback: use stored workspace_id as element hint (won't work but logs will show)
     if not ps_eid_actual:
         for elem in elements:
-            if elem.get("type", "").replace(" ", "").upper() == "PARTSTUDIO":
+            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
                 ps_eid_actual = elem["id"]
                 break
 
