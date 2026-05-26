@@ -154,7 +154,7 @@ def search_by_part_number(part_number: str) -> list[dict]:
                 for p in parts:
                     pnum = p.get("partNumber", "")
                     if pnum.lower() == part_number.lower():
-                        config = p.get("configuration", "")
+                        config = p.get("configuration") or ""
                         results.append({
                             "documentId":    did,
                             "documentName":  name,
@@ -185,7 +185,7 @@ def _get_parts(did: str, wid: str, eid: str) -> list[dict]:
 
 def _is_configured_part(part: dict) -> bool:
     """Return True if this part has a non-default configuration."""
-    config = part.get("configuration", "")
+    config = part.get("configuration") or ""
     return bool(config) and config.lower() not in ("", "default")
 
 
