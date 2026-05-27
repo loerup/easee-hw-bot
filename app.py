@@ -539,7 +539,7 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
     say(text=f"✅ Found in Onshape: *{part['documentName']}*{config_note}\n"
              f"Creating checkout branch…", thread_ts=thread_ts)
 
-    # ③ Create version + branch
+    # ③ Create version on main (branch point reference) + branch
     version_id = oc.create_version(
         did, wid, [part_number],
         label="Check out",
