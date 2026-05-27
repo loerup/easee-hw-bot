@@ -557,7 +557,7 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
     branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
 
     # ④ Export .stp
-    say(text="📦 Exporting .stp file (this takes ~30–60 seconds)…", thread_ts=thread_ts)
+    say(text="📦 Exporting .stp file (this can take 1–3 minutes)…", thread_ts=thread_ts)
     clean_name = oc.clean_filename(part.get("partName", part_number))
     stp_path   = f"/tmp/{clean_name.replace(' ', '_')}.stp"
 
