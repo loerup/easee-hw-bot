@@ -290,28 +290,38 @@ def export_step(did: str, wid: str, eid: str, part_id: str, output_path: str,
 
 
 # ── 4. Create version ─────────────────────────────────────────────────────────
-def create_version(did: str, wid: str, part_numbers: list[str]) -> str | None:
+def create_version(did: str, wid: str, part_numbers: list[str],
+                   label: str = "Check out",
+                   description: str | None = None) -> str | None:
     """
     Create a named version in the document.
-    Names it 'BOT### - Check out reference' and records the checked-out
-    Part#(s) in the description for traceability.
+
+    label       — appended to the version name: 'BOT### - {label} reference'
+    description — full description string; if None a default is generated.
+
     Returns the version ID or None on failure.
     """
-    # Get existing versions to determine next number
+    # Count existing versions to build the BOT### sequence number
     resp = _request("GET", f"/api/v6/documents/d/{did}/versions")
     if resp.status_code != 200:
         print(f"❌ Could not list versions: {resp.status_code}")
         return None
+
     existing = resp.json()
+    # API may return a plain list or a paginated {"items": [...]} object
+    if isinstance(existing, dict):
+        existing = existing.get("items", [])
     next_num = len(existing) + 1
-    version_name = f"BOT{next_num:03d} - Check out reference"
+
     parts_str    = ", ".join(part_numbers)
+    version_name = f"BOT{next_num:03d} - {label} reference"
+    desc         = description or f"CAD-BOT {label.lower()} reference. Part(s): {parts_str}"
 
     body = {
         "documentId":  did,
         "workspaceId": wid,
         "name":        version_name,
-        "description": f"Checked out by agent. Part(s): {parts_str}",
+        "description": desc,
     }
     resp = _request("POST", f"/api/v6/documents/d/{did}/versions", body=body)
     if resp.status_code in (200, 201):
