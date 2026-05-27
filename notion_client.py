@@ -167,18 +167,45 @@ def set_review_required(page_id: str) -> bool:
 
 # ── User resolution ───────────────────────────────────────────────────────────
 
-def resolve_user_by_email(email: str) -> str | None:
+def resolve_notion_user(email: str = "", display_name: str = "") -> str | None:
     """
-    Find a Notion user ID by email address.
-    Used to resolve Slack user → Notion person for 'Who checked out?' field.
+    Find a Notion user ID by email address, with a display-name fallback.
+
+    Notion integrations often cannot read email addresses (requires the
+    'Read user information including email addresses' capability). This function
+    tries email first, then falls back to matching the Slack display name against
+    the Notion user's name field — exact first, then first-name-only.
     """
     resp = requests.get(f"{NOTION_BASE}/users", headers=_headers())
     if resp.status_code != 200:
-        logger.error("Notion users list failed: %s", resp.status_code)
+        logger.error("Notion users list failed: %s — %s", resp.status_code, resp.text[:200])
         return None
-    for user in resp.json().get("results", []):
-        if user.get("type") == "person":
-            if user.get("person", {}).get("email", "").lower() == email.lower():
-                return user["id"]
-    # paginate if needed (unlikely for small orgs)
+
+    people = [u for u in resp.json().get("results", []) if u.get("type") == "person"]
+
+    # 1. Email match (works only if integration has email-read capability)
+    if email:
+        for u in people:
+            if u.get("person", {}).get("email", "").lower() == email.lower():
+                logger.info("Resolved Notion user by email: %s", u.get("name"))
+                return u["id"]
+
+    # 2. Exact name match
+    if display_name:
+        dn_lower = display_name.strip().lower()
+        for u in people:
+            if (u.get("name") or "").strip().lower() == dn_lower:
+                logger.info("Resolved Notion user by exact name: %s", u.get("name"))
+                return u["id"]
+
+        # 3. First-name-only match (handles "Lars Loerup" → "Lars")
+        first = dn_lower.split()[0] if dn_lower else ""
+        if first:
+            for u in people:
+                notion_name = (u.get("name") or "").strip().lower()
+                if notion_name.startswith(first + " ") or notion_name == first:
+                    logger.info("Resolved Notion user by first name: %s", u.get("name"))
+                    return u["id"]
+
+    logger.warning("Could not resolve Notion user for email=%s name=%s", email, display_name)
     return None
