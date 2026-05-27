@@ -582,17 +582,23 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
                        user_email, user_name)
     nc.set_checked_out(page_id, notion_user_id)
 
-    # ⑦ Find blob element for check-in later
-    blob_eid  = None
+    # ⑦ Find the Import feature and blob element via the feature graph:
+    #    part.featureId → Import feature → blobData.namespace → blob element ID
+    #    This is API-driven and does not rely on element names at all.
+    part_feature_id = part.get("featureId", "")
+    _, blob_eid = oc.find_import_and_blob_for_part(did, branch_id, eid, part_feature_id)
+
+    # Resolve blob element name for logging / reference
     blob_name = None
-    elements  = oc._get_elements(did, branch_id)
-    for elem in elements:
-        etype = (elem.get("type") or "").upper()
-        ename = elem.get("name") or ""
-        if etype in ("BLOB", "BLOBMODEL") and part_number.lower() in ename.lower():
-            blob_eid  = elem["id"]
-            blob_name = ename
-            break
+    if blob_eid:
+        for elem in oc._get_elements(did, branch_id):
+            if elem.get("id") == blob_eid:
+                blob_name = elem.get("name") or ""
+                break
+        logger.info("Blob element for %s: '%s' (%s)", part_number, blob_name, blob_eid)
+    else:
+        logger.warning("No blob resolved for %s — check-in will use safe (new blob) path",
+                       part_number)
 
     # ⑧ Save thread context
     db_save_thread_context(
@@ -671,7 +677,9 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
                 break
 
     # Decide: normal path or safe path
-    use_safe_path = is_configured
+    # Safe path is used when: configured part, shared Import feature,
+    # OR no existing blob (native Onshape geometry — engineer must wire it up)
+    use_safe_path = is_configured or not blob_eid
     if not use_safe_path and blob_eid and ps_eid_actual:
         use_safe_path = oc.detect_shared_import(did, branch_id, ps_eid_actual, blob_eid)
 
