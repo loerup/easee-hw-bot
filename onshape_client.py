@@ -296,13 +296,15 @@ def export_step(did: str, wid: str, eid: str, part_id: str, output_path: str,
     Pass `configuration` (e.g. 'Length=120 mm') to export a specific config.
     """
     body = {
-        "formatName":         "STEP",
-        "flattenAssemblies":  False,
-        "yAxisIsUp":          False,
+        "formatName":          "STEP",
+        "flattenAssemblies":   False,
+        "yAxisIsUp":           False,
         "triggerAutoDownload": False,
-        "storeInDocument":    False,
-        "linkDocumentWorkspaceId": wid,
-        "partIds": part_id,  # single part ID as string (not array)
+        "storeInDocument":     False,
+        # Note: linkDocumentWorkspaceId intentionally omitted — it triggers
+        # external-reference resolution which significantly delays translations
+        # on standalone Part Studios.
+        "partIds": part_id,    # single part ID as string (not array)
     }
     params = {}
     if configuration:
@@ -318,9 +320,10 @@ def export_step(did: str, wid: str, eid: str, part_id: str, output_path: str,
     translation_id = resp.json().get("id")
     print(f"  Translation started: {translation_id}")
 
-    # Poll for completion
-    for attempt in range(30):
-        time.sleep(3)
+    # Poll for completion — up to 5 minutes (60 × 5s)
+    # Branch-based exports can take longer than main-workspace exports
+    for attempt in range(60):
+        time.sleep(5)
         poll = _request("GET", f"/api/v6/translations/{translation_id}")
         if poll.status_code != 200:
             print(f"  Poll error: {poll.status_code}")
