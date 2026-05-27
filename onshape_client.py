@@ -122,51 +122,87 @@ def verify_auth() -> bool:
 def search_by_part_number(part_number: str) -> list[dict]:
     """
     Search the Easee AS company workspace (ownerType=1) by Part# directly.
-    Scans Part Studios for an exact partNumber match, stops as soon as found.
+
+    Strategy:
+      1. Fast path  — document text search with q=part_number (matches if doc
+                      name / description contains the part number).
+      2. Slow path  — scan ALL documents in the workspace (paginated, early exit
+                      on first match). Used when the fast path returns nothing,
+                      which is the common case for large multi-part documents
+                      whose names don't contain the Part#.
+
     Returns list of matches: [{documentId, workspaceId, elementId, partId,
                                partName, documentName, elementName, configuration,
                                is_configured}, ...]
     """
-    resp = _request("GET", "/api/v6/documents", params={
-        "q":         part_number,
-        "ownerType": 1,           # Easee AS company workspace only
-        "limit":     20,
-    })
-    if resp.status_code != 200:
-        print(f"❌ Search failed: {resp.status_code} — {resp.text[:300]}")
-        return []
+    # ── Fast path ──────────────────────────────────────────────────────────────
+    result = _scan_workspace_for_part(part_number, query=part_number)
+    if result:
+        return result
 
-    docs = resp.json().get("items", [])
-    results = []
-    for doc in docs:
-        did  = doc["id"]
-        name = doc["name"]
-        if "Outdated" in name or "outdated" in name:
-            continue
-        wid = doc.get("defaultWorkspace", {}).get("id")
-        if not wid:
-            continue
-        elems = _get_elements(did, wid)
-        for elem in elems:
-            # API returns "Part Studio" (with space)
-            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
-                parts = _get_parts(did, wid, elem["id"])
-                for p in parts:
-                    pnum = p.get("partNumber") or ""
-                    if pnum.lower() == part_number.lower():
-                        config = p.get("configuration") or ""
-                        results.append({
-                            "documentId":    did,
-                            "documentName":  name,
-                            "workspaceId":   wid,
-                            "elementId":     elem["id"],
-                            "elementName":   elem.get("name", ""),
-                            "partId":        p.get("partId", ""),
-                            "partName":      p.get("name", ""),
-                            "configuration": config,
-                            "is_configured": _is_configured_part(p),
-                        })
-    return results
+    # ── Slow path: scan all documents ──────────────────────────────────────────
+    print(f"  Fast search found nothing — scanning all workspace documents…")
+    return _scan_workspace_for_part(part_number, query="")
+
+
+def _scan_workspace_for_part(part_number: str, query: str = "",
+                              max_pages: int = 15) -> list[dict]:
+    """
+    Paginate through workspace documents and look for an exact partNumber match.
+    Stops (early exit) as soon as the first match is found.
+    """
+    offset = 0
+    for _ in range(max_pages):
+        params = {"ownerType": 1, "limit": 20, "offset": offset}
+        if query:
+            params["q"] = query
+
+        resp = _request("GET", "/api/v6/documents", params=params)
+        if resp.status_code != 200:
+            print(f"❌ Document list failed: {resp.status_code} — {resp.text[:200]}")
+            break
+
+        data = resp.json()
+        docs = data.get("items", [])
+        if not docs:
+            break
+
+        for doc in docs:
+            did  = doc["id"]
+            name = doc["name"]
+            if "outdated" in name.lower():
+                continue
+            wid = doc.get("defaultWorkspace", {}).get("id")
+            if not wid:
+                continue
+
+            elems = _get_elements(did, wid)
+            for elem in elems:
+                if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+                    parts = _get_parts(did, wid, elem["id"])
+                    for p in parts:
+                        pnum = p.get("partNumber") or ""
+                        if pnum.lower() == part_number.lower():
+                            config = p.get("configuration") or ""
+                            print(f"  ✅ Found {part_number} in '{name}'")
+                            return [{
+                                "documentId":    did,
+                                "documentName":  name,
+                                "workspaceId":   wid,
+                                "elementId":     elem["id"],
+                                "elementName":   elem.get("name") or "",
+                                "partId":        p.get("partId") or "",
+                                "partName":      p.get("name") or "",
+                                "configuration": config,
+                                "is_configured": _is_configured_part(p),
+                            }]
+
+        # No match in this page — next page
+        if not data.get("next"):
+            break
+        offset += 20
+
+    return []
 
 
 def _get_elements(did: str, wid: str) -> list[dict]:
