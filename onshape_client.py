@@ -543,10 +543,12 @@ def detect_shared_import(did: str, wid: str, eid: str, blob_eid: str) -> bool:
                 ns = param.get("namespace", "")
                 if blob_eid in ns:
                     refs += 1
-    shared = refs > 1 or len(import_features) > 1
+    # Only flag as shared if our specific blob is referenced by more than one Import feature.
+    # A document with multiple imported parts legitimately has multiple Import features —
+    # that alone doesn't mean the blob is shared.
+    shared = refs > 1
     if shared:
-        print(f"  ⚠️  Shared Import detected: {len(import_features)} Import feature(s), "
-              f"{refs} reference(s) to this blob")
+        print(f"  ⚠️  Shared Import detected: {refs} Import feature(s) reference this blob")
     return shared
 
 
