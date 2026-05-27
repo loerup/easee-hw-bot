@@ -355,6 +355,42 @@ def find_matching_parts(description: str) -> list[dict]:
         return [], "low"
 
 
+# ── Changelog formatting ──────────────────────────────────────────────────────
+
+CHANGELOG_PROMPT = """You are a technical writer formatting a CAD engineer's check-in notes
+into a clean, concise changelog for an Onshape version description.
+
+Rules:
+- Output ONLY the formatted changelog — no intro, no explanation, no markdown fences
+- Use bullet points (- ) for each distinct change
+- Use clear, professional engineering language (e.g. "Adjusted hole diameter", not "made hole bigger")
+- If the input is already well-structured, lightly clean it up and keep it
+- If the input is vague or conversational, infer the most likely technical meaning
+- Maximum 5 bullet points — combine minor related changes
+- If no meaningful change notes are given, output a single line: "No detailed change notes provided."
+"""
+
+def format_changelog(raw_notes: str) -> str:
+    """
+    Use Claude Haiku to reformat raw Slack check-in notes into a clean
+    engineering changelog. Falls back to raw_notes if Haiku fails.
+    """
+    if not raw_notes or not raw_notes.strip():
+        return "No detailed change notes provided."
+    try:
+        resp = anthropic_client.messages.create(
+            model="claude-haiku-4-5-20251001",
+            max_tokens=300,
+            system=CHANGELOG_PROMPT,
+            messages=[{"role": "user", "content": raw_notes.strip()}],
+        )
+        formatted = resp.content[0].text.strip()
+        return formatted if formatted else raw_notes
+    except Exception as e:
+        logger.warning("Changelog formatting failed, using raw notes: %s", e)
+        return raw_notes
+
+
 # ── Slack helpers ─────────────────────────────────────────────────────────────
 
 def resolve_user(user_id: str) -> tuple[str, str]:
@@ -504,7 +540,11 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
              f"Creating checkout branch…", thread_ts=thread_ts)
 
     # ③ Create version + branch
-    version_id = oc.create_version(did, wid, [part_number])
+    version_id = oc.create_version(
+        did, wid, [part_number],
+        label="Check out",
+        description=f"CAD-BOT check-out reference. Checked out by {user_name}. Part(s): {part_number}",
+    )
     if not version_id:
         say(text="❌ Failed to create checkout version in Onshape.", thread_ts=thread_ts)
         return
@@ -536,9 +576,10 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
             thread_ts=thread_ts)
 
     # ⑥ Update Notion — always update status; resolve person if possible
-    notion_user_id = nc.resolve_user_by_email(user_email) if user_email else None
+    notion_user_id = nc.resolve_notion_user(email=user_email, display_name=user_name)
     if not notion_user_id:
-        logger.warning("Could not resolve Notion user for %s — updating status only", user_email)
+        logger.warning("Could not resolve Notion user for %s / %s — updating status only",
+                       user_email, user_name)
     nc.set_checked_out(page_id, notion_user_id)
 
     # ⑦ Find blob element for check-in later
@@ -649,11 +690,14 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
             say(text="❌ Failed to upload new blob element to Onshape.", thread_ts=thread_ts)
             return
 
+        changelog    = format_changelog(notes)
         version_desc = (
-            f"⚠️ Configured part check-in — new blob '{new_blob_name}' uploaded. "
+            f"Changelog - External Changes - {user_name}: {changelog}\n"
+            f"⚠️ Configured part — new blob '{new_blob_name}' uploaded. "
             f"Import feature requires manual wiring by engineer before merge."
         )
-        vid = oc.create_version(did, branch_id, [part_number])
+        vid = oc.create_version(did, branch_id, [part_number],
+                                label="Check in", description=version_desc)
 
         branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
 
@@ -724,7 +768,12 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
                          "Please update it manually in Onshape.",
                     thread_ts=thread_ts)
 
-        vid        = oc.create_version(did, branch_id, [part_number])
+        changelog = format_changelog(notes)
+        vid = oc.create_version(
+            did, branch_id, [part_number],
+            label="Check in",
+            description=f"Changelog - External Changes - {user_name}: {changelog}",
+        )
         branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
 
         # Update Notion → Checked In
