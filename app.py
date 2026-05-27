@@ -650,6 +650,8 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
     configuration = context["configuration"] or ""
     notion_page_id = context["notion_page_id"]
 
+    logger.info("Checkin context: part=%s did=%s branch=%s blob_eid=%s is_configured=%s",
+                part_number, did, branch_id, blob_eid, is_configured)
     say(text=f"📥 Received your file — running check-in for *{part_number}*…",
         thread_ts=thread_ts)
 
@@ -676,10 +678,13 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
                 ps_eid_actual = elem["id"]
                 break
 
-    # Decide: normal path or safe path
-    # Safe path is used when: configured part, shared Import feature,
-    # OR no existing blob (native Onshape geometry — engineer must wire it up)
-    use_safe_path = is_configured or not blob_eid
+    # Decide: normal path or safe path.
+    # Safe path is used when: no blob was resolved during checkout (couldn't identify
+    # the Import feature via the feature graph), OR the blob is genuinely shared across
+    # multiple Import features (would overwrite geometry for other configured variants).
+    # NOTE: is_configured alone does NOT trigger the safe path — find_import_and_blob_for_part
+    # uses featureId matching and handles configured parts correctly.
+    use_safe_path = not blob_eid
     if not use_safe_path and blob_eid and ps_eid_actual:
         use_safe_path = oc.detect_shared_import(did, branch_id, ps_eid_actual, blob_eid)
 
