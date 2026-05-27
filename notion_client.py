@@ -13,6 +13,7 @@ Database ID: 366db557-b8e3-803c-8c38-000bdc54767d
 import os
 import json
 import logging
+import unicodedata
 import requests
 
 logger = logging.getLogger(__name__)
@@ -167,14 +168,18 @@ def set_review_required(page_id: str) -> bool:
 
 # ── User resolution ───────────────────────────────────────────────────────────
 
+def _nfc(s: str) -> str:
+    """Normalize a string to NFC Unicode form and lowercase — handles ø, æ, å etc."""
+    return unicodedata.normalize("NFC", s).strip().lower()
+
+
 def resolve_notion_user(email: str = "", display_name: str = "") -> str | None:
     """
     Find a Notion user ID by email address, with a display-name fallback.
 
     Notion integrations often cannot read email addresses (requires the
-    'Read user information including email addresses' capability). This function
-    tries email first, then falls back to matching the Slack display name against
-    the Notion user's name field — exact first, then first-name-only.
+    'Read user information including email addresses' capability). Falls back
+    to name matching with full Unicode normalization (handles ø, æ, å, etc.).
     """
     resp = requests.get(f"{NOTION_BASE}/users", headers=_headers())
     if resp.status_code != 200:
@@ -183,29 +188,42 @@ def resolve_notion_user(email: str = "", display_name: str = "") -> str | None:
 
     people = [u for u in resp.json().get("results", []) if u.get("type") == "person"]
 
+    # Log all Notion user names to help debug mismatches
+    notion_names = [u.get("name", "") for u in people]
+    logger.info("Notion workspace users: %s", notion_names)
+
     # 1. Email match (works only if integration has email-read capability)
     if email:
         for u in people:
-            if u.get("person", {}).get("email", "").lower() == email.lower():
+            if _nfc(u.get("person", {}).get("email", "")) == _nfc(email):
                 logger.info("Resolved Notion user by email: %s", u.get("name"))
                 return u["id"]
 
-    # 2. Exact name match
+    # 2. Exact name match (NFC-normalised — handles ø, æ, å, accents)
     if display_name:
-        dn_lower = display_name.strip().lower()
+        dn = _nfc(display_name)
         for u in people:
-            if (u.get("name") or "").strip().lower() == dn_lower:
+            if _nfc(u.get("name") or "") == dn:
                 logger.info("Resolved Notion user by exact name: %s", u.get("name"))
                 return u["id"]
 
-        # 3. First-name-only match (handles "Lars Loerup" → "Lars")
-        first = dn_lower.split()[0] if dn_lower else ""
+        # 3. First-name-only match
+        first = dn.split()[0] if dn else ""
         if first:
             for u in people:
-                notion_name = (u.get("name") or "").strip().lower()
+                notion_name = _nfc(u.get("name") or "")
                 if notion_name.startswith(first + " ") or notion_name == first:
-                    logger.info("Resolved Notion user by first name: %s", u.get("name"))
+                    logger.info("Resolved Notion user by first name '%s': %s",
+                                first, u.get("name"))
                     return u["id"]
 
-    logger.warning("Could not resolve Notion user for email=%s name=%s", email, display_name)
+        # 4. Substring match — last resort (e.g. Slack name is "Lars L" but Notion is "Lars Lørup")
+        for u in people:
+            notion_name = _nfc(u.get("name") or "")
+            if dn in notion_name or notion_name in dn:
+                logger.info("Resolved Notion user by substring match: %s", u.get("name"))
+                return u["id"]
+
+    logger.warning("Could not resolve Notion user for email=%r name=%r — "
+                   "Notion users were: %s", email, display_name, notion_names)
     return None
