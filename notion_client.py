@@ -181,16 +181,26 @@ def resolve_notion_user(email: str = "", display_name: str = "") -> str | None:
     'Read user information including email addresses' capability). Falls back
     to name matching with full Unicode normalization (handles ø, æ, å, etc.).
     """
-    resp = requests.get(f"{NOTION_BASE}/users", headers=_headers())
-    if resp.status_code != 200:
-        logger.error("Notion users list failed: %s — %s", resp.status_code, resp.text[:200])
-        return None
+    # Paginate through all workspace users
+    people = []
+    cursor = None
+    for _ in range(10):  # max 10 pages = 1000 users
+        params = {"page_size": 100}
+        if cursor:
+            params["start_cursor"] = cursor
+        resp = requests.get(f"{NOTION_BASE}/users", headers=_headers(), params=params)
+        if resp.status_code != 200:
+            logger.error("Notion users list failed: %s — %s", resp.status_code, resp.text[:200])
+            break
+        data = resp.json()
+        people.extend(u for u in data.get("results", []) if u.get("type") == "person")
+        if not data.get("has_more"):
+            break
+        cursor = data.get("next_cursor")
 
-    people = [u for u in resp.json().get("results", []) if u.get("type") == "person"]
-
-    # Log all Notion user names to help debug mismatches
+    # Log all names to help debug mismatches
     notion_names = [u.get("name", "") for u in people]
-    logger.info("Notion workspace users: %s", notion_names)
+    logger.info("Notion workspace users (%d): %s", len(people), notion_names)
 
     # 1. Email match (works only if integration has email-read capability)
     if email:
