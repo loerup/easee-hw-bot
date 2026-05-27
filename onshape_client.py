@@ -193,6 +193,7 @@ def _scan_workspace_for_part(part_number: str, query: str = "",
                                 "elementName":   elem.get("name") or "",
                                 "partId":        p.get("partId") or "",
                                 "partName":      p.get("name") or "",
+                                "featureId":     p.get("featureId") or "",
                                 "configuration": config,
                                 "is_configured": _is_configured_part(p),
                             }]
@@ -203,6 +204,67 @@ def _scan_workspace_for_part(part_number: str, query: str = "",
         offset += 20
 
     return []
+
+
+def find_import_and_blob_for_part(did: str, wid: str, eid: str,
+                                   part_feature_id: str) -> tuple[dict | None, str | None]:
+    """
+    Resolve the Import feature and blob element ID for a specific part using
+    the Onshape feature graph — no name matching required.
+
+    Flow:
+      part.featureId  →  Import/importForeign feature  →  blobData.namespace
+                                                          → e{blob_eid}::m{mv}
+
+    Returns (import_feature_dict, blob_eid) or (None, None) on failure.
+    Falls back to the sole Import feature if featureId matching is unavailable.
+    """
+    resp = _request("GET", f"/api/v6/partstudios/d/{did}/w/{wid}/e/{eid}/features")
+    if resp.status_code != 200:
+        print(f"❌ Could not fetch features: {resp.status_code}")
+        return None, None
+
+    features = resp.json().get("features", [])
+    import_features = [
+        f for f in features
+        if (f.get("featureType") or "").lower() in ("import", "importforeign")
+    ]
+
+    if not import_features:
+        print("  No Import features found in Part Studio")
+        return None, None
+
+    # 1. Exact featureId match — most reliable
+    target = None
+    if part_feature_id:
+        for f in import_features:
+            if f.get("featureId") == part_feature_id:
+                target = f
+                print(f"  Matched Import feature by featureId: {f.get('featureId')}")
+                break
+
+    # 2. Fallback: only one Import feature exists — unambiguous
+    if not target and len(import_features) == 1:
+        target = import_features[0]
+        print(f"  Single Import feature found — using it: {target.get('featureId')}")
+
+    if not target:
+        ids = [f.get("featureId") for f in import_features]
+        print(f"  ⚠️ Multiple Import features, no featureId match. "
+              f"part_feature_id={part_feature_id!r}, available={ids}")
+        return None, None
+
+    # 3. Extract blob element ID from blobData namespace: e{eid}::m{mv}
+    for param in target.get("parameters", []):
+        if param.get("parameterId") == "blobData":
+            ns = param.get("namespace", "")
+            if ns.startswith("e") and "::" in ns:
+                blob_eid = ns.split("::")[0][1:]   # strip leading 'e'
+                print(f"  Blob EID resolved from Import feature: {blob_eid}")
+                return target, blob_eid
+
+    print(f"  Import feature found but no blobData namespace: {target.get('featureId')}")
+    return target, None
 
 
 def _get_elements(did: str, wid: str) -> list[dict]:
