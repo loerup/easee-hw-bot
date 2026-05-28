@@ -303,58 +303,64 @@ def build_part_index_background():
     indexed = 0
 
     try:
-        offset = 0
-        while True:
-            params = {"ownerType": 1, "limit": 20, "offset": offset}
-            resp = oc._request("GET", "/api/v6/documents", params=params)
-            if resp.status_code != 200:
-                logger.error("Index build: document list failed: %s", resp.status_code)
-                break
+        # Scope to the Phoenix folder — much faster than full workspace scan
+        folder_id = oc._get_part_folder_id()
+        if folder_id:
+            docs = oc._list_documents_in_folder(folder_id)
+            logger.info("Index build: %d documents in Phoenix folder", len(docs))
+        else:
+            logger.warning("Index build: no folder scope — scanning entire workspace")
+            docs = []
+            offset = 0
+            while True:
+                resp = oc._request("GET", "/api/v6/documents",
+                                   params={"ownerType": 1, "limit": 20, "offset": offset})
+                if resp.status_code != 200:
+                    logger.error("Index build: document list failed: %s", resp.status_code)
+                    break
+                data  = resp.json()
+                docs.extend(data.get("items", []))
+                if not data.get("next"):
+                    break
+                offset += 20
 
-            data = resp.json()
-            docs = data.get("items", [])
-            if not docs:
-                break
+        for i, doc in enumerate(docs):
+            did  = doc["id"]
+            name = doc.get("name", "")
+            if "outdated" in name.lower():
+                continue
+            wid = doc.get("defaultWorkspace", {}).get("id")
+            if not wid:
+                continue
 
-            for doc in docs:
-                did  = doc["id"]
-                name = doc.get("name", "")
-                if "outdated" in name.lower():
-                    continue
-                wid = doc.get("defaultWorkspace", {}).get("id")
-                if not wid:
-                    continue
+            try:
+                elems = oc._get_elements(did, wid)
+                for elem in elems:
+                    if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+                        parts = oc._get_parts(did, wid, elem["id"])
+                        for p in parts:
+                            pnum = p.get("partNumber") or ""
+                            if not pnum:
+                                continue
+                            config = p.get("configuration") or ""
+                            db_cache_part(pnum, {
+                                "documentId":    did,
+                                "documentName":  name,
+                                "workspaceId":   wid,
+                                "elementId":     elem["id"],
+                                "partId":        p.get("partId") or "",
+                                "partName":      p.get("name") or "",
+                                "featureId":     p.get("featureId") or "",
+                                "configuration": config,
+                                "is_configured": oc._is_configured_part(p),
+                            })
+                            indexed += 1
+            except Exception as e:
+                logger.warning("Index build: error scanning doc '%s': %s", name, e)
 
-                try:
-                    elems = oc._get_elements(did, wid)
-                    for elem in elems:
-                        if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
-                            parts = oc._get_parts(did, wid, elem["id"])
-                            for p in parts:
-                                pnum = p.get("partNumber") or ""
-                                if not pnum:
-                                    continue
-                                config = p.get("configuration") or ""
-                                db_cache_part(pnum, {
-                                    "documentId":    did,
-                                    "documentName":  name,
-                                    "workspaceId":   wid,
-                                    "elementId":     elem["id"],
-                                    "partId":        p.get("partId") or "",
-                                    "partName":      p.get("name") or "",
-                                    "featureId":     p.get("featureId") or "",
-                                    "configuration": config,
-                                    "is_configured": oc._is_configured_part(p),
-                                })
-                                indexed += 1
-                except Exception as e:
-                    logger.warning("Index build: error scanning doc '%s': %s", name, e)
-
-            logger.info("Index build progress: %d parts indexed, offset=%d", indexed, offset)
-
-            if not data.get("next"):
-                break
-            offset += 20
+            if (i + 1) % 10 == 0:
+                logger.info("Index build progress: %d parts indexed, %d/%d docs scanned",
+                            indexed, i + 1, len(docs))
 
         db_set_index_status("ready")
         logger.info("Part index build complete: %d parts indexed", indexed)
