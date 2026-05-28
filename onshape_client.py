@@ -240,15 +240,18 @@ def _global_search_for_part(part_number: str) -> list[dict]:
     return []
 
 
-def _scan_workspace_for_part(part_number: str, max_pages: int = 5) -> list[dict]:
+def _scan_workspace_for_part(part_number: str) -> list[dict]:
     """
-    Fallback: paginate through workspace documents looking for an exact Part# match.
-    Only used when the global search returns no results.
-    Fetches 100 documents per page to minimise API round-trips.
+    Fallback: paginate through ALL workspace documents looking for an exact Part#
+    match on the part's partNumber attribute (not document/element name).
+    Called only on a cache miss — the background indexer in app.py populates the
+    SQLite cache so this is rarely needed after the first deploy.
     """
     offset       = 0
     docs_checked = 0
-    for page in range(max_pages):
+    page         = 0
+    while True:
+        page += 1
         params = {"ownerType": 1, "limit": 20, "offset": offset}  # max allowed is 20
         resp = _request("GET", "/api/v6/documents", params=params)
         if resp.status_code != 200:
@@ -293,7 +296,7 @@ def _scan_workspace_for_part(part_number: str, max_pages: int = 5) -> list[dict]
                                 "is_configured": _is_configured_part(p),
                             }]
 
-        print(f"  Fallback scan page {page+1}: {docs_checked} docs checked so far…")
+        print(f"  Fallback scan page {page}: {docs_checked} docs checked so far…")
         if not data.get("next"):
             break
         offset += 20
