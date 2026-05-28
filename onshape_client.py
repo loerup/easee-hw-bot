@@ -128,18 +128,24 @@ def _get_company_id() -> str | None:
     """
     Return the Easee AS company ID, fetching it from the API on first call
     and caching it for the lifetime of the process.
+
+    The API key is scoped to easee.onshape.com, so /api/v6/companies will only
+    return Easee AS — no risk of picking up a different company.
     """
     global _COMPANY_ID
     if _COMPANY_ID:
         return _COMPANY_ID
     resp = _request("GET", "/api/v6/companies")
     if resp.status_code == 200:
-        companies = resp.json()
+        data = resp.json()
+        # API may return a plain list or a paginated {"items": [...]} object
+        companies = data if isinstance(data, list) else data.get("items", [])
         if companies:
             _COMPANY_ID = companies[0].get("id")
-            print(f"  Company ID: {_COMPANY_ID}")
+            company_name = companies[0].get("name", "unknown")
+            print(f"  Easee AS company: '{company_name}' (id: {_COMPANY_ID})")
             return _COMPANY_ID
-    print(f"  ⚠️ Could not fetch company ID: {resp.status_code}")
+    print(f"  ⚠️ Could not fetch company ID: {resp.status_code} — {resp.text[:200]}")
     return None
 
 
@@ -181,14 +187,16 @@ def _global_search_for_part(part_number: str) -> list[dict]:
         print("  Skipping global search — no company ID available")
         return []
 
+    # ownerId scopes the search to Easee AS company documents only.
+    # documentFilter=0 + ownerId is equivalent to ownerType=1 in the documents API.
     body = {
-        "rawQuery":      f"_all:{part_number}",
-        "ownerId":       company_id,
+        "rawQuery":       f"_all:{part_number}",
+        "ownerId":        company_id,
         "documentFilter": 0,
-        "foundIn":       "ALL",
-        "when":          "LATEST",
-        "limit":         10,
-        "offset":        0,
+        "foundIn":        "ALL",
+        "when":           "LATEST",
+        "limit":          10,
+        "offset":         0,
     }
     resp = _request("POST", "/api/v6/documents/search", body=body)
     if resp.status_code != 200:
