@@ -303,26 +303,20 @@ def build_part_index_background():
     indexed = 0
 
     try:
-        # Scope to the Phoenix folder — much faster than full workspace scan
+        # Scope to the Phoenix folder — full workspace scan is intentionally disabled.
+        # If folder can't be resolved, abort and wait for ONSHAPE_PART_FOLDER_ID env var.
         folder_id = oc._get_part_folder_id()
-        if folder_id:
-            docs = oc._list_documents_in_folder(folder_id)
-            logger.info("Index build: %d documents in Phoenix folder", len(docs))
-        else:
-            logger.warning("Index build: no folder scope — scanning entire workspace")
-            docs = []
-            offset = 0
-            while True:
-                resp = oc._request("GET", "/api/v6/documents",
-                                   params={"ownerType": 1, "limit": 20, "offset": offset})
-                if resp.status_code != 200:
-                    logger.error("Index build: document list failed: %s", resp.status_code)
-                    break
-                data  = resp.json()
-                docs.extend(data.get("items", []))
-                if not data.get("next"):
-                    break
-                offset += 20
+        if not folder_id:
+            logger.error(
+                "Index build: could not resolve part folder. "
+                "Set ONSHAPE_PART_FOLDER_ID in Railway env vars to the Onshape folder ID "
+                "for '02. Development > 01. Phoenix' and redeploy."
+            )
+            db_set_index_status("")   # allow retry once env var is set
+            return
+
+        docs = oc._list_documents_in_folder(folder_id)
+        logger.info("Index build: %d documents in Phoenix folder", len(docs))
 
         for i, doc in enumerate(docs):
             did  = doc["id"]
