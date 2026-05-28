@@ -364,8 +364,13 @@ def build_part_index_background():
         db_set_index_status("")   # allow retry on next refresh
 
 
-# Kick off background part index build on startup if not already complete
-if db_get_index_status() != "ready":
+# Kick off background part index build on startup if not already complete.
+# Reset any stale "building" state left over from a crashed/redeployed process.
+_startup_status = db_get_index_status()
+if _startup_status != "ready":
+    if _startup_status == "building":
+        logger.info("Resetting stale 'building' index status from previous session")
+        db_set_index_status("")
     threading.Thread(target=build_part_index_background, daemon=True).start()
 
 
