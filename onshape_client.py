@@ -119,44 +119,131 @@ def verify_auth() -> bool:
 
 
 # ── 2. Search for part by Part# ───────────────────────────────────────────────
-def search_by_part_number(part_number: str) -> list[dict]:
+
+# Module-level company ID cache — fetched once, reused across calls
+_COMPANY_ID: str | None = None
+
+
+def _get_company_id() -> str | None:
     """
-    Search the Easee AS company workspace (ownerType=1) by Part# directly.
+    Return the Easee AS company ID, fetching it from the API on first call
+    and caching it for the lifetime of the process.
+    """
+    global _COMPANY_ID
+    if _COMPANY_ID:
+        return _COMPANY_ID
+    resp = _request("GET", "/api/v6/companies")
+    if resp.status_code == 200:
+        companies = resp.json()
+        if companies:
+            _COMPANY_ID = companies[0].get("id")
+            print(f"  Company ID: {_COMPANY_ID}")
+            return _COMPANY_ID
+    print(f"  ⚠️ Could not fetch company ID: {resp.status_code}")
+    return None
+
+
+def search_by_part_number(part_number: str, hint: str = "") -> list[dict]:
+    """
+    Search the Easee AS workspace for a part by its Part# attribute.
 
     Strategy:
-      1. Fast path  — document text search with q=part_number (matches if doc
-                      name / description contains the part number).
-      2. Slow path  — scan ALL documents in the workspace (paginated, early exit
-                      on first match). Used when the fast path returns nothing,
-                      which is the common case for large multi-part documents
-                      whose names don't contain the Part#.
+      1. Global search  — POST /api/v6/documents/search with rawQuery="_all:<part#>"
+                          Mirrors the Onshape UI search bar. Returns the matching
+                          document(s) in ~1s; we then fetch elements+parts for the
+                          matched doc to get the exact IDs. Total: ~4 API calls.
+      2. Fallback scan  — Full workspace document scan (slow, last resort only).
 
     Returns list of matches: [{documentId, workspaceId, elementId, partId,
                                partName, documentName, elementName, configuration,
                                is_configured}, ...]
     """
-    # ── Fast path ──────────────────────────────────────────────────────────────
-    result = _scan_workspace_for_part(part_number, query=part_number)
+    # ── Global search (primary) ────────────────────────────────────────────────
+    result = _global_search_for_part(part_number)
     if result:
         return result
 
-    # ── Slow path: scan all documents ──────────────────────────────────────────
-    print(f"  Fast search found nothing — scanning all workspace documents…")
-    return _scan_workspace_for_part(part_number, query="")
+    # ── Fallback: brute-force scan (last resort) ───────────────────────────────
+    print(f"  Global search found nothing — falling back to workspace scan…")
+    return _scan_workspace_for_part(part_number)
 
 
-def _scan_workspace_for_part(part_number: str, query: str = "",
-                              max_pages: int = 15) -> list[dict]:
+def _global_search_for_part(part_number: str) -> list[dict]:
     """
-    Paginate through workspace documents and look for an exact partNumber match.
-    Stops (early exit) as soon as the first match is found.
-    """
-    offset = 0
-    for _ in range(max_pages):
-        params = {"ownerType": 1, "limit": 20, "offset": offset}
-        if query:
-            params["q"] = query
+    Use Onshape's global document search API to locate a part by its Part#.
 
+    Uses rawQuery="_all:<part_number>" which searches all indexed fields,
+    including part number metadata attributes — same index the UI search bar uses.
+    Returns results in ~1 second for any workspace size.
+    """
+    company_id = _get_company_id()
+    if not company_id:
+        print("  Skipping global search — no company ID available")
+        return []
+
+    body = {
+        "rawQuery":      f"_all:{part_number}",
+        "ownerId":       company_id,
+        "documentFilter": 0,
+        "foundIn":       "ALL",
+        "when":          "LATEST",
+        "limit":         10,
+        "offset":        0,
+    }
+    resp = _request("POST", "/api/v6/documents/search", body=body)
+    if resp.status_code != 200:
+        print(f"  Global search failed: {resp.status_code} — {resp.text[:200]}")
+        return []
+
+    items = resp.json().get("items", [])
+    print(f"  Global search returned {len(items)} document(s) for '{part_number}'")
+
+    for item in items:
+        did      = item.get("id")
+        wid      = item.get("defaultWorkspace", {}).get("id")
+        doc_name = item.get("name") or ""
+
+        if not did or not wid:
+            continue
+        if "outdated" in doc_name.lower():
+            continue
+
+        # Scan Part Studios in this document for the exact part number
+        elems = _get_elements(did, wid)
+        for elem in elems:
+            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+                parts = _get_parts(did, wid, elem["id"])
+                for p in parts:
+                    pnum = p.get("partNumber") or ""
+                    if pnum.lower() == part_number.lower():
+                        config = p.get("configuration") or ""
+                        print(f"  ✅ Found {part_number} in '{doc_name}' via global search")
+                        return [{
+                            "documentId":    did,
+                            "documentName":  doc_name,
+                            "workspaceId":   wid,
+                            "elementId":     elem["id"],
+                            "elementName":   elem.get("name") or "",
+                            "partId":        p.get("partId") or "",
+                            "partName":      p.get("name") or "",
+                            "featureId":     p.get("featureId") or "",
+                            "configuration": config,
+                            "is_configured": _is_configured_part(p),
+                        }]
+
+    return []
+
+
+def _scan_workspace_for_part(part_number: str, max_pages: int = 5) -> list[dict]:
+    """
+    Fallback: paginate through workspace documents looking for an exact Part# match.
+    Only used when the global search returns no results.
+    Fetches 100 documents per page to minimise API round-trips.
+    """
+    offset       = 0
+    docs_checked = 0
+    for page in range(max_pages):
+        params = {"ownerType": 1, "limit": 100, "offset": offset}
         resp = _request("GET", "/api/v6/documents", params=params)
         if resp.status_code != 200:
             print(f"❌ Document list failed: {resp.status_code} — {resp.text[:200]}")
@@ -176,6 +263,7 @@ def _scan_workspace_for_part(part_number: str, query: str = "",
             if not wid:
                 continue
 
+            docs_checked += 1
             elems = _get_elements(did, wid)
             for elem in elems:
                 if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
@@ -184,7 +272,8 @@ def _scan_workspace_for_part(part_number: str, query: str = "",
                         pnum = p.get("partNumber") or ""
                         if pnum.lower() == part_number.lower():
                             config = p.get("configuration") or ""
-                            print(f"  ✅ Found {part_number} in '{name}'")
+                            print(f"  ✅ Found {part_number} in '{name}' "
+                                  f"(fallback scan, {docs_checked} docs checked)")
                             return [{
                                 "documentId":    did,
                                 "documentName":  name,
@@ -198,10 +287,10 @@ def _scan_workspace_for_part(part_number: str, query: str = "",
                                 "is_configured": _is_configured_part(p),
                             }]
 
-        # No match in this page — next page
+        print(f"  Fallback scan page {page+1}: {docs_checked} docs checked so far…")
         if not data.get("next"):
             break
-        offset += 20
+        offset += 100
 
     return []
 
