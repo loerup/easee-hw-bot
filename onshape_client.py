@@ -353,24 +353,11 @@ def _scan_workspace_for_part(part_number: str) -> list[dict]:
     attribute. Called only on a SQLite cache miss.
     """
     folder_id = _get_part_folder_id()
-    if folder_id:
-        docs = _list_documents_in_folder(folder_id)
-        print(f"  Fallback scan: {len(docs)} docs in Phoenix folder")
-    else:
-        # Full workspace scan — no folder scope available
-        docs = []
-        offset = 0
-        while True:
-            resp = _request("GET", "/api/v6/documents",
-                            params={"ownerType": 1, "limit": 20, "offset": offset})
-            if resp.status_code != 200:
-                break
-            data = resp.json()
-            docs.extend(data.get("items", []))
-            if not data.get("next"):
-                break
-            offset += 20
-        print(f"  Fallback scan: {len(docs)} docs in full workspace")
+    if not folder_id:
+        print(f"  Scan aborted: no folder scope. Set ONSHAPE_PART_FOLDER_ID in Railway.")
+        return []
+    docs = _list_documents_in_folder(folder_id)
+    print(f"  Fallback scan: {len(docs)} docs in Phoenix folder")
 
     for i, doc in enumerate(docs):
         did  = doc["id"]
