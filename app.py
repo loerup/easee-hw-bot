@@ -117,6 +117,23 @@ def init_db():
                 status          TEXT    DEFAULT 'pending'
             )
         """)
+        # Part index cache: maps Part# → Onshape document/element location.
+        # Avoids slow full-workspace scans on repeat checkouts.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS part_index (
+                part_number     TEXT    PRIMARY KEY,
+                doc_id          TEXT    NOT NULL,
+                doc_name        TEXT,
+                workspace_id    TEXT    NOT NULL,
+                element_id      TEXT    NOT NULL,
+                part_id         TEXT,
+                part_name       TEXT,
+                feature_id      TEXT,
+                configuration   TEXT,
+                is_configured   INTEGER DEFAULT 0,
+                cached_at       TEXT    NOT NULL
+            )
+        """)
         conn.commit()
 
 
@@ -187,6 +204,63 @@ def db_save_review(thread_ts, channel, part_number, notion_page_id, blob_name, b
         conn.commit()
 
 
+def db_get_cached_part(part_number: str) -> dict | None:
+    """Return cached Onshape location for a Part#, or None if not cached."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT * FROM part_index WHERE LOWER(part_number) = LOWER(?)",
+            (part_number,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "documentId":    row["doc_id"],
+            "documentName":  row["doc_name"] or "",
+            "workspaceId":   row["workspace_id"],
+            "elementId":     row["element_id"],
+            "partId":        row["part_id"] or "",
+            "partName":      row["part_name"] or "",
+            "featureId":     row["feature_id"] or "",
+            "configuration": row["configuration"] or "",
+            "is_configured": bool(row["is_configured"]),
+        }
+
+
+def db_cache_part(part_number: str, part: dict):
+    """Save an Onshape part location to the index cache."""
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO part_index
+            (part_number, doc_id, doc_name, workspace_id, element_id,
+             part_id, part_name, feature_id, configuration, is_configured, cached_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            part_number,
+            part.get("documentId", ""),
+            part.get("documentName", ""),
+            part.get("workspaceId", ""),
+            part.get("elementId", ""),
+            part.get("partId", ""),
+            part.get("partName", ""),
+            part.get("featureId", ""),
+            part.get("configuration", ""),
+            1 if part.get("is_configured") else 0,
+            now,
+        ))
+        conn.commit()
+    logger.info("Cached Onshape location for %s → %s", part_number, part.get("documentName"))
+
+
+def db_clear_part_index():
+    """Wipe the entire part index cache (used by @CAD-BOT refresh)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM part_index")
+        conn.commit()
+    logger.info("Part index cache cleared")
+
+
 def db_get_pending_review(part_number):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -227,6 +301,7 @@ Rules:
 - action = "status" when user asks what is checked out / currently in use / who has what
 - action = "help" when user asks how to use the bot or what commands exist
 - action = "done" when a Mechanical Engineer says a review is complete (e.g. "done M001432", "done reviewing M001432", "review complete for M001432")
+- action = "refresh" when user asks to refresh, re-index, clear cache, or rebuild the part list
 - part_number: extract if it looks like a product code starting with M followed by digits (e.g. M001432, M001505)
 - part_description: the user's natural language description of the part if no clear part_number
 - notes: any context about changes made or reason for checkout
@@ -243,6 +318,8 @@ def parse_intent(text: str) -> dict:
         return {"action": "help"}
     if lowered in ("status", "list", "overview"):
         return {"action": "status"}
+    if lowered in ("refresh", "re-index", "reindex", "clear cache"):
+        return {"action": "refresh"}
 
     # Explicit checkout / checkin prefix
     for prefix in ("checkout ", "check out ", "check-out "):
@@ -565,16 +642,24 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
         )
         return
 
-    say(text=f"🔍 Found *{part_number} — {part_name}*. Searching Onshape…", thread_ts=thread_ts)
-
-    # ② Search Onshape
-    matches = oc.search_by_part_number(part_number)
-    if not matches:
-        say(text=f"❌ Could not find *{part_number}* in Onshape. Check the Part# and try again.",
+    # ② Search Onshape — check cache first, then live scan
+    cached = db_get_cached_part(part_number)
+    if cached:
+        logger.info("Cache hit for %s → %s", part_number, cached.get("documentName"))
+        say(text=f"🔍 Found *{part_number} — {part_name}*. Located in Onshape (cached)…",
             thread_ts=thread_ts)
-        return
+        part = cached
+    else:
+        say(text=f"🔍 Found *{part_number} — {part_name}*. Searching Onshape…",
+            thread_ts=thread_ts)
+        matches = oc.search_by_part_number(part_number, hint=part_name)
+        if not matches:
+            say(text=f"❌ Could not find *{part_number}* in Onshape. Check the Part# and try again.",
+                thread_ts=thread_ts)
+            return
+        part = matches[0]
+        db_cache_part(part_number, part)
 
-    part = matches[0]
     did           = part["documentId"]
     wid           = part["workspaceId"]
     eid           = part["elementId"]
@@ -1024,6 +1109,13 @@ def handle_mention(event, say):
                 active = [p for p in all_parts
                           if p.get("status") in ("Checked Out", "Review Required")]
                 say(text=format_status(active), thread_ts=thread_ts)
+
+            # ── REFRESH ───────────────────────────────────────────────────────
+            elif action == "refresh":
+                db_clear_part_index()
+                say(text="🔄 Part index cache cleared. The next checkout for each part "
+                         "will re-scan Onshape to rebuild the index.",
+                    thread_ts=thread_ts)
 
             # ── HELP ──────────────────────────────────────────────────────────
             elif action == "help":
