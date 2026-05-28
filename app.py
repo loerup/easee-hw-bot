@@ -134,10 +134,21 @@ def init_db():
                 cached_at       TEXT    NOT NULL
             )
         """)
+        # Tracks background index build state
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS index_meta (
+                key     TEXT PRIMARY KEY,
+                value   TEXT NOT NULL
+            )
+        """)
         conn.commit()
 
 
 init_db()
+
+# Kick off background part index build on startup if not already complete
+if db_get_index_status() != "ready":
+    threading.Thread(target=build_part_index_background, daemon=True).start()
 
 
 # ── SQLite helpers ────────────────────────────────────────────────────────────
@@ -257,8 +268,104 @@ def db_clear_part_index():
     """Wipe the entire part index cache (used by @CAD-BOT refresh)."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM part_index")
+        conn.execute("DELETE FROM index_meta WHERE key = 'status'")
         conn.commit()
     logger.info("Part index cache cleared")
+
+
+def db_get_index_status() -> str:
+    """Return index build status: 'building', 'ready', or '' (not started)."""
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT value FROM index_meta WHERE key = 'status'"
+        ).fetchone()
+        return row[0] if row else ""
+
+
+def db_set_index_status(status: str):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('status', ?)",
+            (status,)
+        )
+        conn.commit()
+
+
+def build_part_index_background():
+    """
+    Background task: scan ALL documents in the Easee AS Onshape workspace and
+    populate the part_index table with every part number found.
+    Runs once on startup (or after @CAD-BOT refresh). Takes several minutes for
+    a large workspace but only runs once — all subsequent lookups are instant.
+    """
+    if db_get_index_status() == "building":
+        logger.info("Part index build already in progress — skipping")
+        return
+
+    db_set_index_status("building")
+    logger.info("Starting background Onshape part index build…")
+    indexed = 0
+
+    try:
+        offset = 0
+        while True:
+            params = {"ownerType": 1, "limit": 20, "offset": offset}
+            resp = oc._request("GET", "/api/v6/documents", params=params)
+            if resp.status_code != 200:
+                logger.error("Index build: document list failed: %s", resp.status_code)
+                break
+
+            data = resp.json()
+            docs = data.get("items", [])
+            if not docs:
+                break
+
+            for doc in docs:
+                did  = doc["id"]
+                name = doc.get("name", "")
+                if "outdated" in name.lower():
+                    continue
+                wid = doc.get("defaultWorkspace", {}).get("id")
+                if not wid:
+                    continue
+
+                try:
+                    elems = oc._get_elements(did, wid)
+                    for elem in elems:
+                        if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+                            parts = oc._get_parts(did, wid, elem["id"])
+                            for p in parts:
+                                pnum = p.get("partNumber") or ""
+                                if not pnum:
+                                    continue
+                                config = p.get("configuration") or ""
+                                db_cache_part(pnum, {
+                                    "documentId":    did,
+                                    "documentName":  name,
+                                    "workspaceId":   wid,
+                                    "elementId":     elem["id"],
+                                    "partId":        p.get("partId") or "",
+                                    "partName":      p.get("name") or "",
+                                    "featureId":     p.get("featureId") or "",
+                                    "configuration": config,
+                                    "is_configured": oc._is_configured_part(p),
+                                })
+                                indexed += 1
+                except Exception as e:
+                    logger.warning("Index build: error scanning doc '%s': %s", name, e)
+
+            logger.info("Index build progress: %d parts indexed, offset=%d", indexed, offset)
+
+            if not data.get("next"):
+                break
+            offset += 20
+
+        db_set_index_status("ready")
+        logger.info("Part index build complete: %d parts indexed", indexed)
+
+    except Exception as e:
+        logger.error("Part index build failed: %s", e, exc_info=True)
+        db_set_index_status("")   # allow retry on next refresh
 
 
 def db_get_pending_review(part_number):
@@ -1113,8 +1220,10 @@ def handle_mention(event, say):
             # ── REFRESH ───────────────────────────────────────────────────────
             elif action == "refresh":
                 db_clear_part_index()
-                say(text="🔄 Part index cache cleared. The next checkout for each part "
-                         "will re-scan Onshape to rebuild the index.",
+                threading.Thread(target=build_part_index_background, daemon=True).start()
+                say(text="🔄 Part index cleared and rebuild started. This runs in the "
+                         "background and takes a few minutes. All checkouts will work "
+                         "normally while it builds.",
                     thread_ts=thread_ts)
 
             # ── HELP ──────────────────────────────────────────────────────────
