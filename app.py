@@ -146,10 +146,6 @@ def init_db():
 
 init_db()
 
-# Kick off background part index build on startup if not already complete
-if db_get_index_status() != "ready":
-    threading.Thread(target=build_part_index_background, daemon=True).start()
-
 
 # ── SQLite helpers ────────────────────────────────────────────────────────────
 
@@ -366,6 +362,11 @@ def build_part_index_background():
     except Exception as e:
         logger.error("Part index build failed: %s", e, exc_info=True)
         db_set_index_status("")   # allow retry on next refresh
+
+
+# Kick off background part index build on startup if not already complete
+if db_get_index_status() != "ready":
+    threading.Thread(target=build_part_index_background, daemon=True).start()
 
 
 def db_get_pending_review(part_number):
