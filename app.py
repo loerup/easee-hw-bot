@@ -309,16 +309,64 @@ Rules:
 """
 
 
-def find_matching_parts(description: str) -> list[dict]:
+def _text_score(description: str, part: dict) -> int:
     """
-    Use Claude Haiku to match a free-text description against all Notion parts.
-    Returns ranked list of matching part dicts (up to 5).
+    Simple word-overlap score between a free-text description and a part's
+    item_name / part_number. Returns the number of description words found
+    in the part fields (case-insensitive). Used as a fast pre-filter before
+    sending anything to Haiku.
+    """
+    haystack = " ".join([
+        (part.get("item_name") or "").lower(),
+        (part.get("part_number") or "").lower(),
+        (part.get("item_category") or "").lower(),
+        " ".join(part.get("part_of_module") or []).lower(),
+    ])
+    words = [w for w in description.lower().split() if len(w) > 2]
+    return sum(1 for w in words if w in haystack)
+
+
+def find_matching_parts(description: str) -> tuple[list[dict], str]:
+    """
+    Match a free-text description against all Notion parts.
+
+    Strategy:
+      1. Fast path — word-overlap text search on item_name / part_number.
+         Handles obvious cases like "chargepack casing" → "ChargePack Casing"
+         without an LLM call.
+      2. Slow path — send the top text candidates (or full list if text finds
+         nothing) to Claude Haiku for semantic/fuzzy matching.
+
+    Returns (matched_parts, confidence).
     """
     all_parts = nc.get_all_parts()
     if not all_parts:
-        return []
+        return [], "low"
 
-    # Build compact representation for Haiku
+    # ── Fast path: word-overlap text search ───────────────────────────────────
+    scored = [(p, _text_score(description, p)) for p in all_parts if p.get("part_number")]
+    scored = [(p, s) for p, s in scored if s > 0]
+    scored.sort(key=lambda x: -x[1])
+
+    if scored:
+        top_score   = scored[0][1]
+        total_words = len([w for w in description.lower().split() if len(w) > 2])
+
+        if total_words > 0 and top_score >= total_words:
+            # All description words matched — high confidence
+            confidence = "high" if len(scored) == 1 else "medium"
+            return [p for p, _ in scored[:5]], confidence
+
+        if top_score >= max(1, total_words // 2):
+            # At least half the words matched — pass candidates to Haiku
+            candidates = [p for p, _ in scored[:20]]
+        else:
+            candidates = None   # Text found nothing useful — send full list
+    else:
+        candidates = None
+
+    # ── Slow path: Haiku semantic matching ────────────────────────────────────
+    pool = candidates if candidates is not None else all_parts
     compact = [
         {
             "part_number":    p["part_number"],
@@ -326,7 +374,7 @@ def find_matching_parts(description: str) -> list[dict]:
             "item_category":  p["item_category"],
             "part_of_module": p["part_of_module"],
         }
-        for p in all_parts if p["part_number"]
+        for p in pool if p.get("part_number")
     ]
 
     try:
@@ -341,13 +389,12 @@ def find_matching_parts(description: str) -> list[dict]:
                 ),
             }],
         )
-        result = json.loads(resp.content[0].text)
+        result     = json.loads(resp.content[0].text)
         matches_pn = result.get("matches", [])
         confidence = result.get("confidence", "low")
 
-        # Resolve part numbers back to full part dicts
         part_map = {p["part_number"]: p for p in all_parts}
-        matched = [part_map[pn] for pn in matches_pn if pn in part_map]
+        matched  = [part_map[pn] for pn in matches_pn if pn in part_map]
         return matched, confidence
 
     except Exception as e:
