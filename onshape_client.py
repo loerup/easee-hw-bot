@@ -188,23 +188,30 @@ def _global_search_for_part(part_number: str) -> list[dict]:
         return []
 
     # ownerId scopes the search to Easee AS company documents only.
-    # documentFilter=0 + ownerId is equivalent to ownerType=1 in the documents API.
-    body = {
-        "rawQuery":       f"_all:{part_number}",
-        "ownerId":        company_id,
-        "documentFilter": 0,
-        "foundIn":        "ALL",
-        "when":           "LATEST",
-        "limit":          10,
-        "offset":         0,
-    }
-    resp = _request("POST", "/api/v6/documents/search", body=body)
-    if resp.status_code != 200:
-        print(f"  Global search failed: {resp.status_code} — {resp.text[:200]}")
-        return []
+    # We try two query forms: "_all:<part#>" (Lucene all-fields) and plain "<part#>".
+    # The plain query matches element/document names; _all also searches metadata.
+    results_by_query: list = []
+    for raw_query in [f"_all:{part_number}", part_number]:
+        body = {
+            "rawQuery":       raw_query,
+            "ownerId":        company_id,
+            "documentFilter": 0,
+            "foundIn":        "ALL",
+            "when":           "LATEST",
+            "limit":          10,
+            "offset":         0,
+        }
+        resp = _request("POST", "/api/v6/documents/search", body=body)
+        if resp.status_code != 200:
+            print(f"  Global search ({raw_query!r}) failed: {resp.status_code} — {resp.text[:200]}")
+            continue
+        items = resp.json().get("items", [])
+        print(f"  Global search ({raw_query!r}) returned {len(items)} document(s)")
+        results_by_query.extend(items)
+        if items:
+            break   # found something — no need to try the next query form
 
-    items = resp.json().get("items", [])
-    print(f"  Global search returned {len(items)} document(s) for '{part_number}'")
+    items = results_by_query
 
     for item in items:
         did      = item.get("id")
@@ -251,7 +258,7 @@ def _scan_workspace_for_part(part_number: str, max_pages: int = 5) -> list[dict]
     offset       = 0
     docs_checked = 0
     for page in range(max_pages):
-        params = {"ownerType": 1, "limit": 100, "offset": offset}
+        params = {"ownerType": 1, "limit": 20, "offset": offset}  # max allowed is 20
         resp = _request("GET", "/api/v6/documents", params=params)
         if resp.status_code != 200:
             print(f"❌ Document list failed: {resp.status_code} — {resp.text[:200]}")
@@ -298,7 +305,7 @@ def _scan_workspace_for_part(part_number: str, max_pages: int = 5) -> list[dict]
         print(f"  Fallback scan page {page+1}: {docs_checked} docs checked so far…")
         if not data.get("next"):
             break
-        offset += 100
+        offset += 20
 
     return []
 
