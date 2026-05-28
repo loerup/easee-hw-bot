@@ -153,24 +153,15 @@ def search_by_part_number(part_number: str, hint: str = "") -> list[dict]:
     """
     Search the Easee AS workspace for a part by its Part# attribute.
 
-    Strategy:
-      1. Global search  — POST /api/v6/documents/search with rawQuery="_all:<part#>"
-                          Mirrors the Onshape UI search bar. Returns the matching
-                          document(s) in ~1s; we then fetch elements+parts for the
-                          matched doc to get the exact IDs. Total: ~4 API calls.
-      2. Fallback scan  — Full workspace document scan (slow, last resort only).
+    The app-level SQLite part_index cache (built in the background on startup)
+    handles the fast path. This function is only called on a cache miss —
+    i.e. the first time a given Part# is checked out after a fresh deploy or
+    after @CAD-BOT refresh.
 
     Returns list of matches: [{documentId, workspaceId, elementId, partId,
                                partName, documentName, elementName, configuration,
                                is_configured}, ...]
     """
-    # ── Global search (primary) ────────────────────────────────────────────────
-    result = _global_search_for_part(part_number)
-    if result:
-        return result
-
-    # ── Fallback: brute-force scan (last resort) ───────────────────────────────
-    print(f"  Global search found nothing — falling back to workspace scan…")
     return _scan_workspace_for_part(part_number)
 
 
