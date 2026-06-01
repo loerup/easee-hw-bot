@@ -28,7 +28,7 @@ import requests
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
 from flask import Flask, request
-from anthropic import Anthropic
+from anthropic import AnthropicBedrock
 
 import onshape_client as oc
 import notion_client as nc
@@ -47,7 +47,10 @@ slack_app = App(
     token=os.environ["SLACK_BOT_TOKEN"],
     signing_secret=os.environ["SLACK_SIGNING_SECRET"],
 )
-anthropic_client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
+anthropic_client = AnthropicBedrock(
+    aws_region=os.environ.get("AWS_REGION", "us-east-1"),
+    default_headers={"x-api-key": os.environ["ANTHROPIC_API_KEY"]},
+)
 flask_app = Flask(__name__)
 handler = SlackRequestHandler(slack_app)
 
@@ -315,49 +318,74 @@ def build_part_index_background():
             db_set_index_status("")   # allow retry once env var is set
             return
 
-        docs = oc._list_documents_in_folder(folder_id)
-        logger.info("Index build: %d documents in Phoenix folder", len(docs))
+        # Streaming BFS — index docs as discovered, no pre-collection of 2609 doc IDs
+        queue = [folder_id]
+        seen_folders: set = set()
+        doc_count = 0
 
-        for i, doc in enumerate(docs):
-            did  = doc["id"]
-            name = doc.get("name", "")
-            if "outdated" in name.lower():
+        while queue:
+            fid = queue.pop(0)
+            if fid in seen_folders:
                 continue
-            wid = doc.get("defaultWorkspace", {}).get("id")
-            if not wid:
-                continue
+            seen_folders.add(fid)
+            offset = 0
+            while True:
+                resp = oc._request("GET", "/api/v6/documents",
+                                   params={"parentId": fid, "limit": 20, "offset": offset})
+                if resp.status_code != 200:
+                    logger.error("Index build: doc list failed for folder %s: %s", fid, resp.status_code)
+                    break
+                data = resp.json()
+                for item in data.get("items", []):
+                    is_folder = item.get("isFolder", False) or item.get("resourceType") == "folder"
+                    if is_folder:
+                        queue.append(item["id"])
+                        continue
 
-            try:
-                elems = oc._get_elements(did, wid)
-                for elem in elems:
-                    if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
-                        parts = oc._get_parts(did, wid, elem["id"])
-                        for p in parts:
-                            pnum = p.get("partNumber") or ""
-                            if not pnum:
-                                continue
-                            config = p.get("configuration") or ""
-                            db_cache_part(pnum, {
-                                "documentId":    did,
-                                "documentName":  name,
-                                "workspaceId":   wid,
-                                "elementId":     elem["id"],
-                                "partId":        p.get("partId") or "",
-                                "partName":      p.get("name") or "",
-                                "featureId":     p.get("featureId") or "",
-                                "configuration": config,
-                                "is_configured": oc._is_configured_part(p),
-                            })
-                            indexed += 1
-            except Exception as e:
-                logger.warning("Index build: error scanning doc '%s': %s", name, e)
+                    did  = item["id"]
+                    name = item.get("name", "")
+                    if "outdated" in name.lower():
+                        continue
+                    wid = item.get("defaultWorkspace", {}).get("id")
+                    if not wid:
+                        continue
+                    doc_count += 1
 
-            if (i + 1) % 10 == 0:
-                logger.info("Index build progress: %d parts indexed, %d/%d docs scanned",
-                            indexed, i + 1, len(docs))
+                    try:
+                        elems = oc._get_elements(did, wid)
+                        for elem in elems:
+                            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+                                parts = oc._get_parts(did, wid, elem["id"])
+                                for p in parts:
+                                    pnum = p.get("partNumber") or ""
+                                    if not pnum:
+                                        continue
+                                    config = p.get("configuration") or ""
+                                    db_cache_part(pnum, {
+                                        "documentId":    did,
+                                        "documentName":  name,
+                                        "workspaceId":   wid,
+                                        "elementId":     elem["id"],
+                                        "partId":        p.get("partId") or "",
+                                        "partName":      p.get("name") or "",
+                                        "featureId":     p.get("featureId") or "",
+                                        "configuration": config,
+                                        "is_configured": oc._is_configured_part(p),
+                                    })
+                                    indexed += 1
+                    except Exception as e:
+                        logger.warning("Index build: error scanning doc '%s': %s", name, e)
+
+                    if doc_count % 20 == 0:
+                        logger.info("Index build progress: %d parts indexed, %d docs scanned",
+                                    indexed, doc_count)
+
+                if not data.get("next"):
+                    break
+                offset += 20
 
         db_set_index_status("ready")
-        logger.info("Part index build complete: %d parts indexed", indexed)
+        logger.info("Part index build complete: %d parts indexed across %d docs", indexed, doc_count)
 
     except Exception as e:
         logger.error("Part index build failed: %s", e, exc_info=True)
@@ -366,12 +394,16 @@ def build_part_index_background():
 
 # Kick off background part index build on startup if not already complete.
 # Reset any stale "building" state left over from a crashed/redeployed process.
-_startup_status = db_get_index_status()
-if _startup_status != "ready":
-    if _startup_status == "building":
-        logger.info("Resetting stale 'building' index status from previous session")
-        db_set_index_status("")
-    threading.Thread(target=build_part_index_background, daemon=True).start()
+# Set DISABLE_INDEX_BUILD=true in Railway env vars to suppress indexing entirely.
+if os.environ.get("DISABLE_INDEX_BUILD", "").lower() == "true":
+    logger.info("Index build disabled via DISABLE_INDEX_BUILD env var — skipping")
+else:
+    _startup_status = db_get_index_status()
+    if _startup_status != "ready":
+        if _startup_status == "building":
+            logger.info("Resetting stale 'building' index status from previous session")
+            db_set_index_status("")
+        threading.Thread(target=build_part_index_background, daemon=True).start()
 
 
 def db_get_pending_review(part_number):
@@ -459,7 +491,7 @@ def parse_intent(text: str) -> dict:
     # Fall back to LLM
     try:
         resp = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="anthropic.claude-haiku-4-5-20251001-v1:0",
             max_tokens=300,
             system=PARSE_PROMPT,
             messages=[{"role": "user", "content": text}],
@@ -569,7 +601,7 @@ def find_matching_parts(description: str) -> tuple[list[dict], str]:
 
     try:
         resp = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="anthropic.claude-haiku-4-5-20251001-v1:0",
             max_tokens=400,
             messages=[{
                 "role": "user",
@@ -616,7 +648,7 @@ def format_changelog(raw_notes: str) -> str:
         return "No detailed change notes provided."
     try:
         resp = anthropic_client.messages.create(
-            model="claude-haiku-4-5-20251001",
+            model="anthropic.claude-haiku-4-5-20251001-v1:0",
             max_tokens=300,
             system=CHANGELOG_PROMPT,
             messages=[{"role": "user", "content": raw_notes.strip()}],
