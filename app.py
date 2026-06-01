@@ -491,7 +491,7 @@ def parse_intent(text: str) -> dict:
     # Fall back to LLM
     try:
         resp = anthropic_client.messages.create(
-            model="anthropic.claude-haiku-4-5-20251001-v1:0",
+            model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
             max_tokens=300,
             system=PARSE_PROMPT,
             messages=[{"role": "user", "content": text}],
@@ -601,7 +601,7 @@ def find_matching_parts(description: str) -> tuple[list[dict], str]:
 
     try:
         resp = anthropic_client.messages.create(
-            model="anthropic.claude-haiku-4-5-20251001-v1:0",
+            model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
             max_tokens=400,
             messages=[{
                 "role": "user",
@@ -648,7 +648,7 @@ def format_changelog(raw_notes: str) -> str:
         return "No detailed change notes provided."
     try:
         resp = anthropic_client.messages.create(
-            model="anthropic.claude-haiku-4-5-20251001-v1:0",
+            model="eu.anthropic.claude-haiku-4-5-20251001-v1:0",
             max_tokens=300,
             system=CHANGELOG_PROMPT,
             messages=[{"role": "user", "content": raw_notes.strip()}],
