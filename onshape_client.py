@@ -259,16 +259,68 @@ def search_by_part_number(part_number: str, hint: str = "") -> list[dict]:
     """
     Search the Easee AS workspace for a part by its Part# attribute.
 
-    The app-level SQLite part_index cache (built in the background on startup)
-    handles the fast path. This function is only called on a cache miss —
-    i.e. the first time a given Part# is checked out after a fresh deploy or
-    after @CAD-BOT refresh.
+    Uses the same global search API the Onshape UI uses — single request,
+    instant results. Falls back to BFS folder scan only if the API returns
+    nothing (e.g. indexing lag on a brand-new part).
 
     Returns list of matches: [{documentId, workspaceId, elementId, partId,
                                partName, documentName, elementName, configuration,
                                is_configured}, ...]
     """
-    return _scan_workspace_for_part(part_number)
+    company_id = _get_company_id()
+    if not company_id:
+        logger.warning("search_by_part_number: could not resolve company ID, falling back to scan")
+        return _scan_workspace_for_part(part_number)
+
+    payload = {
+        "ownerId": company_id,
+        "limit": 10,
+        "offset": 0,
+        "foundIn": "w",
+        "when": "latest",
+        "sortColumn": "",
+        "sortOrder": "",
+        "rawQuery": f"_all:{part_number} type:part",
+        "documentFilter": 7,
+    }
+    try:
+        resp = _request("POST", "/api/v6/documents/search", json=payload)
+        if resp.status_code != 200:
+            logger.warning("Global search returned %s — falling back to scan", resp.status_code)
+            return _scan_workspace_for_part(part_number)
+
+        items = resp.json().get("items", [])
+        results = []
+        for doc in items:
+            for hit in doc.get("searchHits", []):
+                if hit.get("type") != "part":
+                    continue
+                if (hit.get("partNumber") or "").lower() != part_number.lower():
+                    continue
+                wid = (doc.get("defaultWorkspace") or {}).get("id") or hit.get("versionOrWorkspaceId") or ""
+                results.append({
+                    "documentId":    hit.get("documentId") or doc.get("id") or "",
+                    "documentName":  doc.get("name") or "",
+                    "workspaceId":   wid,
+                    "elementId":     hit.get("elementId") or "",
+                    "elementName":   hit.get("elementName") or "",
+                    "partId":        hit.get("partId") or "",
+                    "partName":      hit.get("name") or "",
+                    "featureId":     "",   # not returned by search — resolved later if needed
+                    "configuration": "",
+                    "is_configured": False,
+                })
+
+        if results:
+            logger.info("Global search found %d match(es) for %s", len(results), part_number)
+            return results
+
+        logger.info("Global search found nothing for %s — falling back to BFS scan", part_number)
+        return _scan_workspace_for_part(part_number)
+
+    except Exception as e:
+        logger.warning("Global search error for %s: %s — falling back to scan", part_number, e)
+        return _scan_workspace_for_part(part_number)
 
 
 def _global_search_for_part(part_number: str) -> list[dict]:
@@ -348,48 +400,77 @@ def _global_search_for_part(part_number: str) -> list[dict]:
 
 def _scan_workspace_for_part(part_number: str) -> list[dict]:
     """
-    Fallback: scan all documents in the Phoenix folder (or full workspace if
-    folder resolution fails) for an exact Part# match on the part's partNumber
-    attribute. Called only on a SQLite cache miss.
+    Streaming BFS scan of the Phoenix folder for an exact Part# match.
+    Scans documents as they are discovered — exits immediately on first match
+    without pre-collecting the full document list. Called on a SQLite cache miss.
     """
     folder_id = _get_part_folder_id()
     if not folder_id:
         print(f"  Scan aborted: no folder scope. Set ONSHAPE_PART_FOLDER_ID in Railway.")
         return []
-    docs = _list_documents_in_folder(folder_id)
-    print(f"  Fallback scan: {len(docs)} docs in Phoenix folder")
 
-    for i, doc in enumerate(docs):
-        did  = doc["id"]
-        name = doc.get("name", "")
-        if "outdated" in name.lower():
-            continue
-        wid = doc.get("defaultWorkspace", {}).get("id")
-        if not wid:
-            continue
-        elems = _get_elements(did, wid)
-        for elem in elems:
-            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
-                parts = _get_parts(did, wid, elem["id"])
-                for p in parts:
-                    pnum = p.get("partNumber") or ""
-                    if pnum.lower() == part_number.lower():
-                        config = p.get("configuration") or ""
-                        print(f"  ✅ Found {part_number} in '{name}' "
-                              f"(doc {i+1}/{len(docs)})")
-                        return [{
-                            "documentId":    did,
-                            "documentName":  name,
-                            "workspaceId":   wid,
-                            "elementId":     elem["id"],
-                            "elementName":   elem.get("name") or "",
-                            "partId":        p.get("partId") or "",
-                            "partName":      p.get("name") or "",
-                            "featureId":     p.get("featureId") or "",
-                            "configuration": config,
-                            "is_configured": _is_configured_part(p),
-                        }]
+    queue = [folder_id]
+    seen_folders: set[str] = set()
+    doc_count = 0
 
+    while queue:
+        fid = queue.pop(0)
+        if fid in seen_folders:
+            continue
+        seen_folders.add(fid)
+        offset = 0
+        while True:
+            resp = _request("GET", "/api/v6/documents",
+                            params={"parentId": fid, "limit": 20, "offset": offset})
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+            for item in data.get("items", []):
+                is_folder = item.get("isFolder", False) or item.get("resourceType") == "folder"
+                if is_folder:
+                    queue.append(item["id"])
+                    continue
+
+                # Scan this document immediately — don't wait for full collection
+                did  = item["id"]
+                name = item.get("name", "")
+                if "outdated" in name.lower():
+                    continue
+                wid = item.get("defaultWorkspace", {}).get("id")
+                if not wid:
+                    continue
+                doc_count += 1
+                try:
+                    elems = _get_elements(did, wid)
+                    for elem in elems:
+                        if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+                            parts = _get_parts(did, wid, elem["id"])
+                            for p in parts:
+                                pnum = p.get("partNumber") or ""
+                                if pnum.lower() == part_number.lower():
+                                    config = p.get("configuration") or ""
+                                    print(f"  ✅ Found {part_number} in '{name}' "
+                                          f"(scanned {doc_count} docs)")
+                                    return [{
+                                        "documentId":    did,
+                                        "documentName":  name,
+                                        "workspaceId":   wid,
+                                        "elementId":     elem["id"],
+                                        "elementName":   elem.get("name") or "",
+                                        "partId":        p.get("partId") or "",
+                                        "partName":      p.get("name") or "",
+                                        "featureId":     p.get("featureId") or "",
+                                        "configuration": config,
+                                        "is_configured": _is_configured_part(p),
+                                    }]
+                except Exception as e:
+                    print(f"  Warning: error scanning '{name}': {e}")
+
+            if not data.get("next"):
+                break
+            offset += 20
+
+    print(f"  Part {part_number} not found after scanning {doc_count} docs")
     return []
 
 
