@@ -1058,6 +1058,20 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
                          "Please update it manually in Onshape.",
                     thread_ts=thread_ts)
 
+        # Update Notion → Checked In (before version creation so it's not skipped on error)
+        logger.info("Updating Notion for %s (page_id=%s)", part_number, notion_page_id)
+        if notion_page_id:
+            try:
+                ok = nc.set_checked_in(notion_page_id)
+                if ok:
+                    logger.info("Notion updated → Checked In for %s", part_number)
+                else:
+                    logger.error("Notion update failed for %s (page %s)", part_number, notion_page_id)
+            except Exception as e:
+                logger.error("Notion update exception for %s: %s", part_number, e)
+        else:
+            logger.warning("No notion_page_id for %s — Notion not updated", part_number)
+
         changelog = format_changelog(notes)
         vid = oc.create_version(
             did, branch_id, [part_number],
@@ -1065,10 +1079,6 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
             description=f"Changelog - External Changes - {user_name}: {changelog}",
         )
         branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
-
-        # Update Notion → Checked In
-        if notion_page_id:
-            nc.set_checked_in(notion_page_id)
 
         notes_text = f"\n📝 Notes: {notes}" if notes else ""
         say(
