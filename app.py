@@ -9,7 +9,7 @@ Trigger: @CAD-BOT <command>
 
 Commands:
   checkout <part name/number>   — find part in Onshape, export .stp, share in thread
-  checkin  [notes]              — return modified .stp (attach file); run in checkout thread
+  checkin  [notes]              — return modified .stp (attach file); attach .stp anywhere in channel
   done <part number>            — [Engineer] mark configured-part review complete
   status                        — show all currently checked-out parts (from Notion)
   help                          — explain the workflow
@@ -21,13 +21,13 @@ import json
 import logging
 import sqlite3
 import tempfile
-import threading
+import threading   # still needed for Slack event background processing
 from datetime import datetime, timezone
 
 import requests
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
-from flask import Flask, request
+from flask import Flask, request as flask_request
 from anthropic import AnthropicBedrock
 
 import onshape_client as oc
@@ -120,30 +120,6 @@ def init_db():
                 status          TEXT    DEFAULT 'pending'
             )
         """)
-        # Part index cache: maps Part# → Onshape document/element location.
-        # Avoids slow full-workspace scans on repeat checkouts.
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS part_index (
-                part_number     TEXT    PRIMARY KEY,
-                doc_id          TEXT    NOT NULL,
-                doc_name        TEXT,
-                workspace_id    TEXT    NOT NULL,
-                element_id      TEXT    NOT NULL,
-                part_id         TEXT,
-                part_name       TEXT,
-                feature_id      TEXT,
-                configuration   TEXT,
-                is_configured   INTEGER DEFAULT 0,
-                cached_at       TEXT    NOT NULL
-            )
-        """)
-        # Tracks background index build state
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS index_meta (
-                key     TEXT PRIMARY KEY,
-                value   TEXT NOT NULL
-            )
-        """)
         conn.commit()
 
 
@@ -214,196 +190,17 @@ def db_save_review(thread_ts, channel, part_number, notion_page_id, blob_name, b
         conn.commit()
 
 
-def db_get_cached_part(part_number: str) -> dict | None:
-    """Return cached Onshape location for a Part#, or None if not cached."""
+
+def db_get_thread_context_by_part(part_number: str):
+    """Return the most recent thread_context row for a given Part#, or None."""
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT * FROM part_index WHERE LOWER(part_number) = LOWER(?)",
+        return conn.execute(
+            """SELECT * FROM thread_context
+               WHERE LOWER(part_number) = LOWER(?)
+               ORDER BY created_at DESC LIMIT 1""",
             (part_number,)
         ).fetchone()
-        if not row:
-            return None
-        return {
-            "documentId":    row["doc_id"],
-            "documentName":  row["doc_name"] or "",
-            "workspaceId":   row["workspace_id"],
-            "elementId":     row["element_id"],
-            "partId":        row["part_id"] or "",
-            "partName":      row["part_name"] or "",
-            "featureId":     row["feature_id"] or "",
-            "configuration": row["configuration"] or "",
-            "is_configured": bool(row["is_configured"]),
-        }
-
-
-def db_cache_part(part_number: str, part: dict):
-    """Save an Onshape part location to the index cache."""
-    now = datetime.now(timezone.utc).isoformat()
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("""
-            INSERT OR REPLACE INTO part_index
-            (part_number, doc_id, doc_name, workspace_id, element_id,
-             part_id, part_name, feature_id, configuration, is_configured, cached_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            part_number,
-            part.get("documentId", ""),
-            part.get("documentName", ""),
-            part.get("workspaceId", ""),
-            part.get("elementId", ""),
-            part.get("partId", ""),
-            part.get("partName", ""),
-            part.get("featureId", ""),
-            part.get("configuration", ""),
-            1 if part.get("is_configured") else 0,
-            now,
-        ))
-        conn.commit()
-    logger.info("Cached Onshape location for %s → %s", part_number, part.get("documentName"))
-
-
-def db_clear_part_index():
-    """Wipe the entire part index cache (used by @CAD-BOT refresh)."""
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM part_index")
-        conn.execute("DELETE FROM index_meta WHERE key = 'status'")
-        conn.commit()
-    logger.info("Part index cache cleared")
-
-
-def db_get_index_status() -> str:
-    """Return index build status: 'building', 'ready', or '' (not started)."""
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT value FROM index_meta WHERE key = 'status'"
-        ).fetchone()
-        return row[0] if row else ""
-
-
-def db_set_index_status(status: str):
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('status', ?)",
-            (status,)
-        )
-        conn.commit()
-
-
-def build_part_index_background():
-    """
-    Background task: scan ALL documents in the Easee AS Onshape workspace and
-    populate the part_index table with every part number found.
-    Runs once on startup (or after @CAD-BOT refresh). Takes several minutes for
-    a large workspace but only runs once — all subsequent lookups are instant.
-    """
-    if db_get_index_status() == "building":
-        logger.info("Part index build already in progress — skipping")
-        return
-
-    db_set_index_status("building")
-    logger.info("Starting background Onshape part index build…")
-    indexed = 0
-
-    try:
-        # Scope to the Phoenix folder — full workspace scan is intentionally disabled.
-        # If folder can't be resolved, abort and wait for ONSHAPE_PART_FOLDER_ID env var.
-        folder_id = oc._get_part_folder_id()
-        if not folder_id:
-            logger.error(
-                "Index build: could not resolve part folder. "
-                "Set ONSHAPE_PART_FOLDER_ID in Railway env vars to the Onshape folder ID "
-                "for '02. Development > 01. Phoenix' and redeploy."
-            )
-            db_set_index_status("")   # allow retry once env var is set
-            return
-
-        # Streaming BFS — index docs as discovered, no pre-collection of 2609 doc IDs
-        queue = [folder_id]
-        seen_folders: set = set()
-        doc_count = 0
-
-        while queue:
-            fid = queue.pop(0)
-            if fid in seen_folders:
-                continue
-            seen_folders.add(fid)
-            offset = 0
-            while True:
-                resp = oc._request("GET", "/api/v6/documents",
-                                   params={"parentId": fid, "limit": 20, "offset": offset})
-                if resp.status_code != 200:
-                    logger.error("Index build: doc list failed for folder %s: %s", fid, resp.status_code)
-                    break
-                data = resp.json()
-                for item in data.get("items", []):
-                    is_folder = item.get("isFolder", False) or item.get("resourceType") == "folder"
-                    if is_folder:
-                        queue.append(item["id"])
-                        continue
-
-                    did  = item["id"]
-                    name = item.get("name", "")
-                    if "outdated" in name.lower():
-                        continue
-                    wid = item.get("defaultWorkspace", {}).get("id")
-                    if not wid:
-                        continue
-                    doc_count += 1
-
-                    try:
-                        elems = oc._get_elements(did, wid)
-                        for elem in elems:
-                            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
-                                parts = oc._get_parts(did, wid, elem["id"])
-                                for p in parts:
-                                    pnum = p.get("partNumber") or ""
-                                    if not pnum:
-                                        continue
-                                    config = p.get("configuration") or ""
-                                    db_cache_part(pnum, {
-                                        "documentId":    did,
-                                        "documentName":  name,
-                                        "workspaceId":   wid,
-                                        "elementId":     elem["id"],
-                                        "partId":        p.get("partId") or "",
-                                        "partName":      p.get("name") or "",
-                                        "featureId":     p.get("featureId") or "",
-                                        "configuration": config,
-                                        "is_configured": oc._is_configured_part(p),
-                                    })
-                                    indexed += 1
-                    except Exception as e:
-                        logger.warning("Index build: error scanning doc '%s': %s", name, e)
-
-                    if doc_count % 20 == 0:
-                        logger.info("Index build progress: %d parts indexed, %d docs scanned",
-                                    indexed, doc_count)
-
-                if not data.get("next"):
-                    break
-                offset += 20
-
-        db_set_index_status("ready")
-        logger.info("Part index build complete: %d parts indexed across %d docs", indexed, doc_count)
-
-    except Exception as e:
-        logger.error("Part index build failed: %s", e, exc_info=True)
-        db_set_index_status("")   # allow retry on next refresh
-
-
-# Kick off background part index build on startup if not already complete.
-# Reset any stale "building" state left over from a crashed/redeployed process.
-# Set DISABLE_INDEX_BUILD=true in Railway env vars to suppress indexing entirely.
-if os.environ.get("DISABLE_INDEX_BUILD", "").lower() == "true":
-    logger.info("Index build disabled via DISABLE_INDEX_BUILD env var — skipping")
-else:
-    _startup_status = db_get_index_status()
-    if _startup_status != "ready":
-        if _startup_status == "building":
-            logger.info("Resetting stale 'building' index status from previous session")
-            db_set_index_status("")
-        threading.Thread(target=build_part_index_background, daemon=True).start()
 
 
 def db_get_pending_review(part_number):
@@ -446,7 +243,6 @@ Rules:
 - action = "status" when user asks what is checked out / currently in use / who has what
 - action = "help" when user asks how to use the bot or what commands exist
 - action = "done" when a Mechanical Engineer says a review is complete (e.g. "done M001432", "done reviewing M001432", "review complete for M001432")
-- action = "refresh" when user asks to refresh, re-index, clear cache, or rebuild the part list
 - part_number: extract if it looks like a product code starting with M followed by digits (e.g. M001432, M001505)
 - part_description: the user's natural language description of the part if no clear part_number
 - notes: any context about changes made or reason for checkout
@@ -463,9 +259,6 @@ def parse_intent(text: str) -> dict:
         return {"action": "help"}
     if lowered in ("status", "list", "overview"):
         return {"action": "status"}
-    if lowered in ("refresh", "re-index", "reindex", "clear cache"):
-        return {"action": "refresh"}
-
     # Explicit checkout / checkin prefix
     for prefix in ("checkout ", "check out ", "check-out "):
         if lowered.startswith(prefix):
@@ -720,8 +513,9 @@ I handle the full CAD handoff between *Onshape* (Engineering) and *Fusion 360* (
 • `@CAD-BOT checkout <part name or number>`
   → I find the part in Onshape, create a checkout branch, export the .stp, and share it here.
 
-• `@CAD-BOT checkin [notes]` _(reply in the checkout thread, attach the modified .stp)_
+• `@CAD-BOT checkin [notes]` _(attach the modified .stp — works from any message in this channel)_
   → I upload your file back into Onshape and notify Engineering to review.
+  → If multiple parts are checked out, add the Part# e.g. `checkin M001432 [notes]`
 
 • `@CAD-BOT done <part number>` _(Mechanical Engineers only)_
   → Marks a configured-part review as complete in Notion.
@@ -735,7 +529,7 @@ I handle the full CAD handoff between *Onshape* (Engineering) and *Fusion 360* (
 *Workflow:*
 1️⃣  `checkout` the part → I share the .stp in this thread
 2️⃣  Edit in Fusion 360
-3️⃣  Reply in this thread: `@CAD-BOT checkin` with your modified file attached
+3️⃣  `@CAD-BOT checkin` anywhere in this channel with your modified file attached
 4️⃣  Engineering reviews and merges the branch in Onshape"""
 
 
@@ -756,6 +550,43 @@ def format_status(parts: list[dict]) -> str:
         for p in review:
             lines.append(f"  • *{p['part_number']}* — {p['item_name']}")
     return "\n".join(lines)
+
+
+# ── Part Studio feature classifier ───────────────────────────────────────────
+
+# Feature types that represent native modelling operations (not imports)
+_NATIVE_FEATURE_TYPES = {
+    "extrude", "revolve", "sweep", "loft", "fillet", "chamfer", "shell",
+    "mirror", "pattern", "boolean", "hole", "sketch", "transform",
+    "move", "cut", "surface", "thicken", "split",
+}
+
+def classify_part_studio(features: list[dict]) -> str:
+    """
+    Classify a Part Studio's feature composition.
+
+    Returns:
+      "import_only"    — only Import/importForeign features (+ suppressed/minor helpers)
+      "import_extras"  — has Import feature(s) AND native modelling features
+      "native"         — no Import feature at all (modelled from scratch in Onshape)
+    """
+    import_types = {"import", "importforeign"}
+    has_import  = False
+    has_native  = False
+
+    for f in features:
+        ft = (f.get("featureType") or "").lower()
+        if ft in import_types:
+            has_import = True
+        elif ft and ft not in ("", "start", "end"):
+            # Any other real feature counts as native geometry
+            has_native = True
+
+    if has_import and not has_native:
+        return "import_only"
+    if has_import and has_native:
+        return "import_extras"
+    return "native"
 
 
 # ── Core workflow handlers ────────────────────────────────────────────────────
@@ -787,23 +618,15 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
         )
         return
 
-    # ② Search Onshape — check cache first, then live scan
-    cached = db_get_cached_part(part_number)
-    if cached:
-        logger.info("Cache hit for %s → %s", part_number, cached.get("documentName"))
-        say(text=f"🔍 Found *{part_number} — {part_name}*. Located in Onshape (cached)…",
+    # ② Search Onshape via global search API (instant — no cache needed)
+    say(text=f"🔍 Found *{part_number} — {part_name}*. Searching Onshape…",
+        thread_ts=thread_ts)
+    matches = oc.search_by_part_number(part_number, hint=part_name)
+    if not matches:
+        say(text=f"❌ Could not find *{part_number}* in Onshape. Check the Part# and try again.",
             thread_ts=thread_ts)
-        part = cached
-    else:
-        say(text=f"🔍 Found *{part_number} — {part_name}*. Searching Onshape…",
-            thread_ts=thread_ts)
-        matches = oc.search_by_part_number(part_number, hint=part_name)
-        if not matches:
-            say(text=f"❌ Could not find *{part_number}* in Onshape. Check the Part# and try again.",
-                thread_ts=thread_ts)
-            return
-        part = matches[0]
-        db_cache_part(part_number, part)
+        return
+    part = matches[0]
 
     did           = part["documentId"]
     wid           = part["workspaceId"]
@@ -907,24 +730,28 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
 def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
                    user_name: str, notes: str | None):
     """
-    Full check-in flow:
-    1. Download .stp from Slack
-    2. Detect configured/shared Import feature
-    3. Normal path: update blob + Import feature + version → Checked In
-    4. Safe path: new blob + version with warning → Review Required + engineer ping
+    Full check-in flow.
+
+    Three paths based on Part Studio feature composition:
+      A. import_only    — update existing blob + Import feature → Checked In
+      B. import_extras  — same as A, but warn engineer that native features exist
+      C. native         — no Import feature; upload .stp as new blob → Review Required
+
+    Within path A/B, a "safe" sub-path is used when the blob is shared across
+    multiple Import features (configured parts) — uploads a new blob instead of
+    overwriting the shared one.
     """
     channel   = event["channel"]
     event_ts  = event["ts"]
     thread_ts = event.get("thread_ts", event_ts)
 
-    part_number   = context["part_number"]
-    part_name     = context["part_name"] or part_number
-    did           = context["doc_id"]
-    branch_id     = context["branch_id"]
-    blob_eid      = context["blob_eid"]
-    ps_eid        = context["workspace_id"]   # note: this is main WID; PS EID is separate
-    is_configured = bool(context["is_configured"])
-    configuration = context["configuration"] or ""
+    part_number    = context["part_number"]
+    part_name      = context["part_name"] or part_number
+    did            = context["doc_id"]
+    branch_id      = context["branch_id"]
+    blob_eid       = context["blob_eid"]
+    is_configured  = bool(context["is_configured"])
+    configuration  = context["configuration"] or ""
     notion_page_id = context["notion_page_id"]
 
     logger.info("Checkin context: part=%s did=%s branch=%s blob_eid=%s is_configured=%s",
@@ -932,14 +759,14 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
     say(text=f"📥 Received your file — running check-in for *{part_number}*…",
         thread_ts=thread_ts)
 
-    # Download file from Slack
+    # ① Download file from Slack
     try:
         local_stp = download_slack_file(stp_file)
     except Exception as e:
         say(text=f"❌ Could not download your file: `{e}`", thread_ts=thread_ts)
         return
 
-    # Find the Part Studio EID in the branch
+    # ② Find the Part Studio EID in the branch
     elements = oc._get_elements(did, branch_id)
     ps_eid_actual = None
     for elem in elements:
@@ -948,28 +775,105 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
         if etype == "PARTSTUDIO" and part_number[:4].lower() in ename.lower():
             ps_eid_actual = elem["id"]
             break
-    # fallback: use stored workspace_id as element hint (won't work but logs will show)
     if not ps_eid_actual:
         for elem in elements:
             if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
                 ps_eid_actual = elem["id"]
                 break
 
-    # Decide: normal path or safe path.
-    # Safe path is used when: no blob was resolved during checkout (couldn't identify
-    # the Import feature via the feature graph), OR the blob is genuinely shared across
-    # multiple Import features (would overwrite geometry for other configured variants).
-    # NOTE: is_configured alone does NOT trigger the safe path — find_import_and_blob_for_part
-    # uses featureId matching and handles configured parts correctly.
+    if not ps_eid_actual:
+        say(text="❌ Could not find the Part Studio in the checkout branch.", thread_ts=thread_ts)
+        try:
+            os.unlink(local_stp)
+        except Exception:
+            pass
+        return
+
+    # ③ Fetch features and classify the Part Studio
+    feat_resp = oc._request(
+        "GET", f"/api/v6/partstudios/d/{did}/w/{branch_id}/e/{ps_eid_actual}/features"
+    )
+    if feat_resp.status_code != 200:
+        say(text="❌ Could not read Part Studio features.", thread_ts=thread_ts)
+        try:
+            os.unlink(local_stp)
+        except Exception:
+            pass
+        return
+
+    features     = feat_resp.json().get("features", [])
+    ps_class     = classify_part_studio(features)
+    branch_url   = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
+    changelog    = format_changelog(notes)
+    notes_text   = f"\n📝 Notes: {notes}" if notes else ""
+
+    logger.info("Part Studio classification for %s: %s", part_number, ps_class)
+
+    # ══ PATH C: Native Onshape geometry — no Import feature ══════════════════
+    if ps_class == "native":
+        say(text=f"ℹ️ *{part_number}* is modelled natively in Onshape (no Import feature). "
+                 f"Uploading your .stp as a reference blob for engineer review…",
+            thread_ts=thread_ts)
+
+        new_blob_name = f"{part_number}_external_reference.step"
+        new_eid = oc.create_new_blob_element(did, branch_id, local_stp, new_blob_name)
+        if not new_eid:
+            say(text="❌ Failed to upload blob element to Onshape.", thread_ts=thread_ts)
+            try:
+                os.unlink(local_stp)
+            except Exception:
+                pass
+            return
+
+        version_desc = (
+            f"Changelog - External Changes - {user_name}: {changelog}\n"
+            f"⚠️ Native part — external .stp '{new_blob_name}' uploaded as reference. "
+            f"Engineer must manually integrate geometry into the Part Studio."
+        )
+        oc.create_version(did, branch_id, [part_number],
+                          label="Check in", description=version_desc)
+
+        if notion_page_id:
+            nc.set_review_required(notion_page_id)
+        db_save_review(thread_ts, channel, part_number, notion_page_id,
+                       new_blob_name, branch_url)
+
+        say(
+            text=f"⚠️ *Review required — native Onshape part*\n"
+                 f"*{part_number}* is modelled directly in Onshape, not via an Import feature.\n"
+                 f"Your .stp has been uploaded as `{new_blob_name}` on the branch.\n"
+                 f"🔗 {branch_url}\n\n"
+                 f"A *Mechanical Engineer* must:\n"
+                 f"1. Open the branch in Onshape\n"
+                 f"2. Review the external .stp geometry\n"
+                 f"3. Manually update or replace the native model as appropriate\n"
+                 f"4. Merge the branch to main\n\n"
+                 f"Once done, reply: `@CAD-BOT done {part_number}`",
+            thread_ts=thread_ts,
+        )
+        try:
+            os.unlink(local_stp)
+        except Exception:
+            pass
+        return
+
+    # ══ PATH A / B: Part has an Import feature ════════════════════════════════
+
+    import_feature = next(
+        (f for f in features
+         if f.get("featureType", "").lower() in ("import", "importforeign")), None
+    )
+
+    # Determine safe sub-path: no blob resolved at checkout OR blob is shared
     use_safe_path = not blob_eid
-    if not use_safe_path and blob_eid and ps_eid_actual:
+    if not use_safe_path and blob_eid:
         use_safe_path = oc.detect_shared_import(did, branch_id, ps_eid_actual, blob_eid)
 
     if use_safe_path:
-        # ── SAFE PATH (configured / shared Import) ────────────────────────────
-        config_slug = re.sub(r'[^a-zA-Z0-9]', '_', configuration)[:20]
-        new_blob_name = f"{part_number}_{config_slug}_checkin.step" if config_slug \
-                        else f"{part_number}_checkin.step"
+        # ── SAFE SUB-PATH: configured / shared Import ─────────────────────────
+        config_slug   = re.sub(r'[^a-zA-Z0-9]', '_', configuration)[:20]
+        new_blob_name = (f"{part_number}_{config_slug}_checkin.step" if config_slug
+                         else f"{part_number}_checkin.step")
 
         say(text=f"⚠️ *Configured or shared part detected* — uploading as new blob "
                  f"(Import feature will need manual wiring by an engineer)…",
@@ -978,24 +882,22 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
         new_eid = oc.create_new_blob_element(did, branch_id, local_stp, new_blob_name)
         if not new_eid:
             say(text="❌ Failed to upload new blob element to Onshape.", thread_ts=thread_ts)
+            try:
+                os.unlink(local_stp)
+            except Exception:
+                pass
             return
 
-        changelog    = format_changelog(notes)
         version_desc = (
             f"Changelog - External Changes - {user_name}: {changelog}\n"
             f"⚠️ Configured part — new blob '{new_blob_name}' uploaded. "
             f"Import feature requires manual wiring by engineer before merge."
         )
-        vid = oc.create_version(did, branch_id, [part_number],
-                                label="Check in", description=version_desc)
+        oc.create_version(did, branch_id, [part_number],
+                          label="Check in", description=version_desc)
 
-        branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
-
-        # Update Notion → Review Required
         if notion_page_id:
             nc.set_review_required(notion_page_id)
-
-        # Save to review queue
         db_save_review(thread_ts, channel, part_number, notion_page_id,
                        new_blob_name, branch_url)
 
@@ -1014,39 +916,21 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
         )
 
     else:
-        # ── NORMAL PATH ───────────────────────────────────────────────────────
-        if not blob_eid:
-            say(text="❌ No blob element found for this part in the checkout branch. "
-                     "Please check in manually via Onshape.",
-                thread_ts=thread_ts)
-            return
-        if not ps_eid_actual:
-            say(text="❌ Could not find the Part Studio in the checkout branch.",
-                thread_ts=thread_ts)
-            return
-
-        # Upload blob
+        # ── NORMAL SUB-PATH: update blob in-place ─────────────────────────────
         new_mv = oc.update_blob_element(did, branch_id, blob_eid, local_stp)
         if not new_mv:
             new_mv = oc.get_blob_microversion(did, branch_id, blob_eid)
         if not new_mv:
             say(text="❌ Blob upload to Onshape failed.", thread_ts=thread_ts)
+            try:
+                os.unlink(local_stp)
+            except Exception:
+                pass
             return
 
-        # Get current Import feature
-        resp = oc._request("GET",
-            f"/api/v6/partstudios/d/{did}/w/{branch_id}/e/{ps_eid_actual}/features")
-        if resp.status_code != 200:
-            say(text="❌ Could not read Part Studio features.", thread_ts=thread_ts)
-            return
-        features = resp.json().get("features", [])
-        import_feature = next(
-            (f for f in features
-             if f.get("featureType", "").lower() in ("import", "importforeign")), None
-        )
         if not import_feature:
-            say(text="⚠️ Import feature not found — blob uploaded but feature not updated. "
-                     "Please update the Import feature manually in Onshape.",
+            say(text="⚠️ Blob uploaded but Import feature not found — "
+                     "please update it manually in Onshape.",
                 thread_ts=thread_ts)
         else:
             ok = oc.update_import_feature(
@@ -1058,7 +942,7 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
                          "Please update it manually in Onshape.",
                     thread_ts=thread_ts)
 
-        # Update Notion → Checked In (before version creation so it's not skipped on error)
+        # Update Notion before version creation (avoids Notion being skipped on error)
         logger.info("Updating Notion for %s (page_id=%s)", part_number, notion_page_id)
         if notion_page_id:
             try:
@@ -1072,19 +956,23 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
         else:
             logger.warning("No notion_page_id for %s — Notion not updated", part_number)
 
-        changelog = format_changelog(notes)
-        vid = oc.create_version(
+        oc.create_version(
             did, branch_id, [part_number],
             label="Check in",
             description=f"Changelog - External Changes - {user_name}: {changelog}",
         )
-        branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
 
-        notes_text = f"\n📝 Notes: {notes}" if notes else ""
+        # Extra note for import_extras: warn engineer native features exist
+        extras_note = (
+            "\n\n⚠️ _This part has native Onshape features in addition to the Import. "
+            "Please verify the imported geometry interacts correctly with them._"
+        ) if ps_class == "import_extras" else ""
+
         say(
             text=f"✅ *{part_number} — {part_name}* has been checked back in by *{user_name}*."
                  f"{notes_text}"
                  f"\n🔗 Onshape branch ready for review: {branch_url}"
+                 f"{extras_note}"
                  f"\n\n🔧 *Mechanical Engineer:* please review and merge the branch to main.",
             thread_ts=thread_ts,
         )
@@ -1215,11 +1103,51 @@ def handle_mention(event, say):
             # ── CHECKIN ──────────────────────────────────────────────────────
             elif action == "checkin":
                 context = db_get_thread_context(thread_ts)
+
                 if not context:
-                    say(text="⚠️ I don't have a checkout context for this thread. "
-                             "Make sure you reply in the *same thread* as the original checkout.",
-                        thread_ts=thread_ts)
-                    return
+                    # ── Universal checkin: no thread context in this thread ────
+                    # Look up what's currently checked out and reconstruct context.
+                    explicit_pn = intent.get("part_number")
+
+                    if explicit_pn:
+                        # User specified a Part# — look it up directly
+                        context = db_get_thread_context_by_part(explicit_pn)
+                        if not context:
+                            say(text=f"⚠️ No active checkout found for *{explicit_pn}*. "
+                                     f"Run `@CAD-BOT status` to see what's checked out.",
+                                thread_ts=thread_ts)
+                            return
+                    else:
+                        # No Part# given — find what this user has checked out
+                        all_parts = nc.get_all_parts()
+                        user_parts = [
+                            p for p in all_parts
+                            if p.get("status") == "Checked Out"
+                        ]
+
+                        if not user_parts:
+                            say(text="⚠️ No parts are currently checked out. "
+                                     "Nothing to check in.",
+                                thread_ts=thread_ts)
+                            return
+
+                        if len(user_parts) == 1:
+                            pn = user_parts[0]["part_number"]
+                            context = db_get_thread_context_by_part(pn)
+                            if not context:
+                                say(text=f"⚠️ Found *{pn}* checked out in Notion but couldn't "
+                                         f"locate the checkout session. "
+                                         f"Please specify: `@CAD-BOT checkin {pn}`",
+                                    thread_ts=thread_ts)
+                                return
+                        else:
+                            # Multiple parts checked out — ask user to specify
+                            lines = ["Multiple parts are currently checked out. "
+                                     "Which one are you checking in? Reply with the Part#:\n"]
+                            for p in user_parts:
+                                lines.append(f"  • `{p['part_number']}` — {p.get('item_name', '')}")
+                            say(text="\n".join(lines), thread_ts=thread_ts)
+                            return
 
                 files    = event.get("files", [])
                 stp_file = next((f for f in files
@@ -1265,15 +1193,6 @@ def handle_mention(event, say):
                           if p.get("status") in ("Checked Out", "Review Required")]
                 say(text=format_status(active), thread_ts=thread_ts)
 
-            # ── REFRESH ───────────────────────────────────────────────────────
-            elif action == "refresh":
-                db_clear_part_index()
-                threading.Thread(target=build_part_index_background, daemon=True).start()
-                say(text="🔄 Part index cleared and rebuild started. This runs in the "
-                         "background and takes a few minutes. All checkouts will work "
-                         "normally while it builds.",
-                    thread_ts=thread_ts)
-
             # ── HELP ──────────────────────────────────────────────────────────
             elif action == "help":
                 say(text=HELP_TEXT, thread_ts=thread_ts)
@@ -1302,7 +1221,7 @@ def handle_mention(event, say):
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
-    return handler.handle(request)
+    return handler.handle(flask_request)
 
 
 @flask_app.route("/health", methods=["GET"])
