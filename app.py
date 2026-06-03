@@ -120,6 +120,19 @@ def init_db():
                 status          TEXT    DEFAULT 'pending'
             )
         """)
+        # Pending update confirmation: stores update request while waiting for
+        # user to confirm they want to proceed despite a part being checked out.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_update_confirmation (
+                thread_ts       TEXT    PRIMARY KEY,
+                channel         TEXT    NOT NULL,
+                user_id         TEXT    NOT NULL,
+                part_number     TEXT    NOT NULL,
+                file_info_json  TEXT    NOT NULL,
+                notes           TEXT,
+                created_at      TEXT    NOT NULL
+            )
+        """)
         conn.commit()
 
 
@@ -203,6 +216,36 @@ def db_get_thread_context_by_part(part_number: str):
         ).fetchone()
 
 
+def db_save_pending_update(thread_ts, channel, user_id, part_number, file_info, notes):
+    now = datetime.now(timezone.utc).isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("""
+            INSERT OR REPLACE INTO pending_update_confirmation
+            (thread_ts, channel, user_id, part_number, file_info_json, notes, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (thread_ts, channel, user_id, part_number,
+              json.dumps(file_info), notes, now))
+        conn.commit()
+
+
+def db_get_pending_update(thread_ts):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT * FROM pending_update_confirmation WHERE thread_ts = ?",
+            (thread_ts,)
+        ).fetchone()
+
+
+def db_clear_pending_update(thread_ts):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM pending_update_confirmation WHERE thread_ts = ?",
+            (thread_ts,)
+        )
+        conn.commit()
+
+
 def db_get_pending_review(part_number):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -231,7 +274,7 @@ Extract the user's intent and return ONLY valid JSON — no explanation, no mark
 
 JSON schema:
 {
-  "action": "checkout" | "checkin" | "status" | "help" | "done" | "unknown",
+  "action": "checkout" | "checkin" | "update" | "status" | "help" | "done" | "unknown",
   "part_description": string | null,
   "part_number": string | null,
   "notes": string | null
@@ -242,6 +285,7 @@ Rules:
 - action = "checkin" when user is returning/uploading a modified file or checking back in
 - action = "status" when user asks what is checked out / currently in use / who has what
 - action = "help" when user asks how to use the bot or what commands exist
+- action = "update" when a designer wants to push a new .step file to Onshape without a full checkout cycle (e.g. "update", "update M001432", "push new geometry")
 - action = "done" when a Mechanical Engineer says a review is complete (e.g. "done M001432", "done reviewing M001432", "review complete for M001432")
 - part_number: extract if it looks like a product code starting with M followed by digits (e.g. M001432, M001505)
 - part_description: the user's natural language description of the part if no clear part_number
@@ -276,6 +320,16 @@ def parse_intent(text: str) -> dict:
     if lowered in ("checkin", "check in", "check-in"):
         return {"action": "checkin", "part_number": None, "part_description": None, "notes": None}
 
+    for prefix in ("update ", "push "):
+        if lowered.startswith(prefix):
+            rest = text[len(prefix):].strip()
+            pn = _extract_part_number(rest)
+            return {"action": "update", "part_number": pn,
+                    "notes": rest if not pn else re.sub(r'\bM\d{4,6}\b', '', rest, flags=re.IGNORECASE).strip() or None}
+
+    if lowered in ("update", "push"):
+        return {"action": "update", "part_number": None, "notes": None}
+
     # "done M######"
     done_match = re.match(r'^done\s+(M\d+)', text, re.IGNORECASE)
     if done_match:
@@ -298,6 +352,11 @@ def parse_intent(text: str) -> dict:
 def _extract_part_number(text: str) -> str | None:
     m = PART_NUMBER_RE.search(text)
     return m.group(0).upper() if m else None
+
+
+def _part_number_from_filename(filename: str) -> str | None:
+    """Try to extract a Part# from a .step filename (e.g. 'M001237 - Display Casing.step')."""
+    return _extract_part_number(os.path.splitext(filename)[0])
 
 
 # ── Disambiguation helpers ────────────────────────────────────────────────────
@@ -517,8 +576,12 @@ I handle the full CAD handoff between *Onshape* (Engineering) and *Fusion 360* (
   → I upload your file back into Onshape and notify Engineering to review.
   → If multiple parts are checked out, add the Part# e.g. `checkin M001432 [notes]`
 
+• `@CAD-BOT update [part number] [notes]` _(attach a .step file)_
+  → Push new geometry directly without a checkout. Bot creates a branch and notifies Engineering to review.
+  → Part# can be in the message or in the filename (e.g. `M001237 - Display Casing.step`).
+
 • `@CAD-BOT done <part number>` _(Mechanical Engineers only)_
-  → Marks a configured-part review as complete in Notion.
+  → Marks a review as complete in Notion after merging the branch in Onshape.
 
 • `@CAD-BOT status`
   → Shows all parts currently checked out (from Notion database).
@@ -983,253 +1046,258 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
         pass
 
 
-# ── Main event handler ────────────────────────────────────────────────────────
+def handle_update(event, say, part_number: str, notion_part: dict,
+                  stp_file: dict, user_name: str, notes: str | None):
+    """
+    Update flow — push new geometry to Onshape without a prior checkout.
 
-@slack_app.event("app_mention")
-def handle_mention(event, say):
+    1. Search Onshape for the part
+    2. Create "Update reference" version on main
+    3. Create "Update - Agent" branch
+    4. Classify Part Studio features
+    5. Apply import or native path (same logic as checkin)
+    6. Create version on branch
+    7. Update Notion → Review Required
+    8. Save to review_queue for engineer `done` command
+    """
     channel   = event["channel"]
     event_ts  = event["ts"]
     thread_ts = event.get("thread_ts", event_ts)
-    user_id   = event["user"]
+    page_id   = notion_part["page_id"]
+    part_name = notion_part.get("item_name") or part_number
 
-    # 👀 react immediately so user knows we're working
+    say(text=f"🔍 Found *{part_number} — {part_name}*. Searching Onshape…",
+        thread_ts=thread_ts)
+
+    # ① Onshape search
+    matches = oc.search_by_part_number(part_number)
+    if not matches:
+        say(text=f"❌ Could not find *{part_number}* in Onshape. Check the Part# and try again.",
+            thread_ts=thread_ts)
+        return
+    part = matches[0]
+
+    did  = part["documentId"]
+    wid  = part["workspaceId"]
+    eid  = part["elementId"]
+    part_id       = part["partId"]
+    configuration = part.get("configuration", "")
+    is_configured = part.get("is_configured", False)
+
+    config_note = f" _(config: {configuration})_" if is_configured else ""
+    say(text=f"✅ Found in Onshape: *{part['documentName']}*{config_note}\n"
+             f"Creating update branch…", thread_ts=thread_ts)
+
+    # ② Create "Update reference" version on main
+    version_id = oc.create_version(
+        did, wid, [part_number],
+        label="Update",
+        description=f"CAD-BOT update reference. Submitted by {user_name}. Part(s): {part_number}",
+    )
+    if not version_id:
+        say(text="❌ Failed to create update version in Onshape.", thread_ts=thread_ts)
+        return
+
+    # ③ Create "Update - Agent" branch
+    branch_id = oc.create_update_branch(did, version_id, [part_number])
+    if not branch_id:
+        say(text="❌ Failed to create update branch in Onshape.", thread_ts=thread_ts)
+        return
+
+    branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
+
+    # ④ Download .step file from Slack
     try:
-        slack_app.client.reactions_add(channel=channel, timestamp=event_ts, name="eyes")
-    except Exception:
-        pass
+        local_stp = download_slack_file(stp_file)
+    except Exception as e:
+        say(text=f"❌ Could not download your file: `{e}`", thread_ts=thread_ts)
+        return
 
-    def _process():
+    # ⑤ Find Part Studio EID in the branch
+    elements = oc._get_elements(did, branch_id)
+    ps_eid_actual = None
+    for elem in elements:
+        etype = (elem.get("type") or "").replace(" ", "").upper()
+        ename = elem.get("name") or ""
+        if etype == "PARTSTUDIO" and part_number[:4].lower() in ename.lower():
+            ps_eid_actual = elem["id"]
+            break
+    if not ps_eid_actual:
+        for elem in elements:
+            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+                ps_eid_actual = elem["id"]
+                break
+
+    if not ps_eid_actual:
+        say(text="❌ Could not find the Part Studio in the update branch.", thread_ts=thread_ts)
         try:
-            raw_text  = strip_mentions(event.get("text", ""))
-            user_name, user_email = resolve_user(user_id)
+            os.unlink(local_stp)
+        except Exception:
+            pass
+        return
 
-            # ── CHECK: pending disambiguation in this thread ──────────────────
-            disam = db_get_disambiguation(thread_ts)
-            if disam:
-                candidates = json.loads(disam["candidates_json"])
-                lowered    = raw_text.strip().lower()
+    # ⑥ Fetch features and classify
+    feat_resp = oc._request(
+        "GET", f"/api/v6/partstudios/d/{did}/w/{branch_id}/e/{ps_eid_actual}/features"
+    )
+    if feat_resp.status_code != 200:
+        say(text="❌ Could not read Part Studio features.", thread_ts=thread_ts)
+        try:
+            os.unlink(local_stp)
+        except Exception:
+            pass
+        return
 
-                # Accept "1", "2", … or a Part# directly
-                selected = None
-                if re.match(r'^\d+$', lowered):
-                    idx = int(lowered) - 1
-                    if 0 <= idx < len(candidates):
-                        selected = candidates[idx]
-                else:
-                    pn = _extract_part_number(raw_text)
-                    if pn:
-                        selected = next(
-                            (c for c in candidates if c["part_number"].upper() == pn), None
-                        )
+    features   = feat_resp.json().get("features", [])
+    ps_class   = classify_part_studio(features)
+    changelog  = format_changelog(notes)
+    notes_text = f"\n📝 Notes: {notes}" if notes else ""
 
-                if selected:
-                    db_clear_disambiguation(thread_ts)
-                    notion_parts = nc.search_part(selected["part_number"])
-                    if notion_parts:
-                        handle_checkout(event, say, selected["part_number"],
-                                        selected.get("item_name"), notion_parts[0],
-                                        user_id, user_name, user_email)
-                    else:
-                        say(text=f"⚠️ Could not find *{selected['part_number']}* in the Notion database.",
-                            thread_ts=thread_ts)
-                else:
-                    say(text="I didn't catch that. Please reply with the number of the part "
-                             "you want, e.g. `1` or `M001432`.",
-                        thread_ts=thread_ts)
-                return
+    logger.info("Update: Part Studio classification for %s: %s", part_number, ps_class)
 
-            intent = parse_intent(raw_text)
-            action = intent.get("action", "unknown")
+    # ══ PATH C: Native part ════════════════════════════════════════════════════
+    if ps_class == "native":
+        say(text=f"ℹ️ *{part_number}* is modelled natively in Onshape. "
+                 f"Uploading your .step as a reference blob…",
+            thread_ts=thread_ts)
 
-            # ── CHECKOUT ─────────────────────────────────────────────────────
-            if action == "checkout":
-                part_number = intent.get("part_number")
-                description = intent.get("part_description") or intent.get("part_name")
-
-                if part_number:
-                    # Direct Part# lookup
-                    notion_parts = nc.search_part(part_number)
-                    if not notion_parts:
-                        say(text=f"⚠️ *{part_number}* is not in the Phoenix Check In / Out database. "
-                                 f"Ask your engineer to add it before checking out.",
-                            thread_ts=thread_ts)
-                        return
-                    handle_checkout(event, say, part_number, None, notion_parts[0],
-                                    user_id, user_name, user_email)
-
-                elif description:
-                    # Disambiguation via Haiku + Notion
-                    say(text=f"🔍 Looking up parts matching _{description}_…",
-                        thread_ts=thread_ts)
-                    matches, confidence = find_matching_parts(description)
-
-                    if not matches:
-                        say(text=f"❌ I couldn't find any parts matching _{description}_. "
-                                 f"Try using the Part# directly (e.g. `checkout M001432`).",
-                            thread_ts=thread_ts)
-                        return
-
-                    if confidence == "high" and len(matches) == 1:
-                        # Single clear match — proceed directly
-                        p = matches[0]
-                        notion_parts = nc.search_part(p["part_number"])
-                        if notion_parts:
-                            handle_checkout(event, say, p["part_number"],
-                                            p.get("item_name"), notion_parts[0],
-                                            user_id, user_name, user_email)
-                        return
-
-                    # Multiple candidates — ask user to pick
-                    lines = [f"I found {len(matches)} possible match(es) for _{description}_. "
-                             f"Reply with the number to confirm:\n"]
-                    for i, p in enumerate(matches[:5], 1):
-                        module = ", ".join(p.get("part_of_module", []))
-                        lines.append(
-                            f"*{i}.* `{p['part_number']}` — {p['item_name']} "
-                            f"({p.get('item_category', '')} | {module})"
-                        )
-                    say(text="\n".join(lines), thread_ts=thread_ts)
-                    db_save_disambiguation(thread_ts, channel, user_id,
-                                           [{"part_number": p["part_number"],
-                                             "item_name": p["item_name"]}
-                                            for p in matches[:5]],
-                                           raw_text)
-                else:
-                    say(text="I need a part name or number. Try:\n"
-                             "`@CAD-BOT checkout M001432` or\n"
-                             "`@CAD-BOT checkout busbar in phase selector for N`",
-                        thread_ts=thread_ts)
-
-            # ── CHECKIN ──────────────────────────────────────────────────────
-            elif action == "checkin":
-                context = db_get_thread_context(thread_ts)
-
-                if not context:
-                    # ── Universal checkin: no thread context in this thread ────
-                    # Look up what's currently checked out and reconstruct context.
-                    explicit_pn = intent.get("part_number")
-
-                    if explicit_pn:
-                        # User specified a Part# — look it up directly
-                        context = db_get_thread_context_by_part(explicit_pn)
-                        if not context:
-                            say(text=f"⚠️ No active checkout found for *{explicit_pn}*. "
-                                     f"Run `@CAD-BOT status` to see what's checked out.",
-                                thread_ts=thread_ts)
-                            return
-                    else:
-                        # No Part# given — find what this user has checked out
-                        all_parts = nc.get_all_parts()
-                        user_parts = [
-                            p for p in all_parts
-                            if p.get("status") == "Checked Out"
-                        ]
-
-                        if not user_parts:
-                            say(text="⚠️ No parts are currently checked out. "
-                                     "Nothing to check in.",
-                                thread_ts=thread_ts)
-                            return
-
-                        if len(user_parts) == 1:
-                            pn = user_parts[0]["part_number"]
-                            context = db_get_thread_context_by_part(pn)
-                            if not context:
-                                say(text=f"⚠️ Found *{pn}* checked out in Notion but couldn't "
-                                         f"locate the checkout session. "
-                                         f"Please specify: `@CAD-BOT checkin {pn}`",
-                                    thread_ts=thread_ts)
-                                return
-                        else:
-                            # Multiple parts checked out — ask user to specify
-                            lines = ["Multiple parts are currently checked out. "
-                                     "Which one are you checking in? Reply with the Part#:\n"]
-                            for p in user_parts:
-                                lines.append(f"  • `{p['part_number']}` — {p.get('item_name', '')}")
-                            say(text="\n".join(lines), thread_ts=thread_ts)
-                            return
-
-                files    = event.get("files", [])
-                stp_file = next((f for f in files
-                                 if f.get("name", "").lower().endswith((".step", ".stp"))), None)
-                if not stp_file:
-                    say(text="📎 Please attach your modified *.step* or *.stp* file to the message.",
-                        thread_ts=thread_ts)
-                    return
-
-                notes = intent.get("notes")
-                handle_checkin(event, say, context, stp_file, user_name, notes)
-
-            # ── DONE (engineer review) ────────────────────────────────────────
-            elif action == "done":
-                part_number = intent.get("part_number")
-                if not part_number:
-                    say(text="Please specify the part number: `@CAD-BOT done M001432`",
-                        thread_ts=thread_ts)
-                    return
-
-                review = db_get_pending_review(part_number)
-                if not review:
-                    say(text=f"⚠️ No pending review found for *{part_number}*.",
-                        thread_ts=thread_ts)
-                    return
-
-                if review["notion_page_id"]:
-                    nc.set_checked_in(review["notion_page_id"])
-
-                db_close_review(part_number)
-
-                say(
-                    text=f"✅ Review for *{part_number}* marked complete.\n"
-                         f"Notion updated → *Checked In*. "
-                         f"Make sure the branch has been merged to main in Onshape.",
-                    thread_ts=thread_ts,
-                )
-
-            # ── STATUS ────────────────────────────────────────────────────────
-            elif action == "status":
-                all_parts = nc.get_all_parts()
-                active = [p for p in all_parts
-                          if p.get("status") in ("Checked Out", "Review Required")]
-                say(text=format_status(active), thread_ts=thread_ts)
-
-            # ── HELP ──────────────────────────────────────────────────────────
-            elif action == "help":
-                say(text=HELP_TEXT, thread_ts=thread_ts)
-
-            # ── UNKNOWN ───────────────────────────────────────────────────────
-            else:
-                say(text="I'm not sure what you mean. Try `@CAD-BOT help`.",
-                    thread_ts=thread_ts)
-
-        except Exception as e:
-            logger.error("Error handling mention: %s", e, exc_info=True)
-            say(text=f"⚠️ Something went wrong: `{e}`", thread_ts=thread_ts)
-        finally:
+        new_blob_name = f"{part_number}_update_reference.step"
+        new_eid = oc.create_new_blob_element(did, branch_id, local_stp, new_blob_name)
+        if not new_eid:
+            say(text="❌ Failed to upload blob to Onshape.", thread_ts=thread_ts)
             try:
-                slack_app.client.reactions_remove(
-                    channel=channel, timestamp=event_ts, name="eyes"
-                )
+                os.unlink(local_stp)
             except Exception:
                 pass
+            return
 
-    # Run in background thread — Onshape export can take 30–90 s
-    threading.Thread(target=_process, daemon=True).start()
+        version_desc = (
+            f"Update - External Changes - {user_name}: {changelog}\n"
+            f"⚠️ Native part — external .step '{new_blob_name}' uploaded as reference. "
+            f"Engineer must manually integrate geometry."
+        )
+        oc.create_version(did, branch_id, [part_number],
+                          label="Update check in", description=version_desc)
 
+        nc.set_review_required(page_id)
+        db_save_review(thread_ts, channel, part_number, page_id, new_blob_name, branch_url)
 
-# ── Flask routes ──────────────────────────────────────────────────────────────
+        say(
+            text=f"⚠️ *Review required — native Onshape part*\n"
+                 f"New geometry for *{part_number} — {part_name}* submitted by *{user_name}*."
+                 f"{notes_text}\n"
+                 f"🔗 {branch_url}\n\n"
+                 f"A *Mechanical Engineer* must:\n"
+                 f"1. Open the branch in Onshape\n"
+                 f"2. Review `{new_blob_name}` and integrate the geometry\n"
+                 f"3. Merge the branch to main\n\n"
+                 f"Once done, reply: `@CAD-BOT done {part_number}`",
+            thread_ts=thread_ts,
+        )
+        try:
+            os.unlink(local_stp)
+        except Exception:
+            pass
+        return
 
-@flask_app.route("/slack/events", methods=["POST"])
-def slack_events():
-    return handler.handle(request)
+    # ══ PATH A / B: Part has an Import feature ═════════════════════════════════
 
+    # Resolve the Import feature and blob EID
+    part_feature_id = part.get("featureId", "")
+    import_feature, blob_eid = oc.find_import_and_blob_for_part(
+        did, branch_id, ps_eid_actual, part_feature_id
+    )
 
-@flask_app.route("/health", methods=["GET"])
-def health():
-    return {"status": "ok", "onshape_base": oc.BASE_URL}, 200
+    # Decide safe vs normal sub-path
+    use_safe_path = not blob_eid
+    if not use_safe_path and blob_eid:
+        use_safe_path = oc.detect_shared_import(did, branch_id, ps_eid_actual, blob_eid)
 
+    if use_safe_path:
+        # ── SAFE SUB-PATH ─────────────────────────────────────────────────────
+        config_slug   = re.sub(r'[^a-zA-Z0-9]', '_', configuration)[:20]
+        new_blob_name = (f"{part_number}_{config_slug}_update.step" if config_slug
+                         else f"{part_number}_update.step")
 
-# ── Entry point ───────────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 3000))
-    flask_app.run(host="0.0.0.0", port=port)
+        say(text=f"⚠️ *Configured or shared part* — uploading as new blob…",
+            thread_ts=thread_ts)
+
+        new_eid = oc.create_new_blob_element(did, branch_id, local_stp, new_blob_name)
+        if not new_eid:
+            say(text="❌ Failed to upload blob to Onshape.", thread_ts=thread_ts)
+            try:
+                os.unlink(local_stp)
+            except Exception:
+                pass
+            return
+
+        version_desc = (
+            f"Update - External Changes - {user_name}: {changelog}\n"
+            f"⚠️ Configured part — new blob '{new_blob_name}' uploaded. "
+            f"Import feature requires manual wiring before merge."
+        )
+        oc.create_version(did, branch_id, [part_number],
+                          label="Update check in", description=version_desc)
+
+        nc.set_review_required(page_id)
+        db_save_review(thread_ts, channel, part_number, page_id, new_blob_name, branch_url)
+
+        say(
+            text=f"⚠️ *Review required — configured part*\n"
+                 f"New geometry for *{part_number} — {part_name}* submitted by *{user_name}*."
+                 f"{notes_text}\n"
+                 f"🔗 {branch_url}\n\n"
+                 f"A *Mechanical Engineer* must:\n"
+                 f"1. Open the branch in Onshape\n"
+                 f"2. Wire `{new_blob_name}` to the correct Import feature\n"
+                 f"3. Verify geometry regenerates correctly\n"
+                 f"4. Merge the branch to main\n\n"
+                 f"Once done, reply: `@CAD-BOT done {part_number}`",
+            thread_ts=thread_ts,
+        )
+
+    else:
+        # ── NORMAL SUB-PATH: update blob in-place ─────────────────────────────
+        say(text="⬆️ Uploading geometry to Onshape…", thread_ts=thread_ts)
+
+        new_mv = oc.update_blob_element(did, branch_id, blob_eid, local_stp)
+        if not new_mv:
+            new_mv = oc.get_blob_microversion(did, branch_id, blob_eid)
+        if not new_mv:
+            say(text="❌ Blob upload to Onshape failed.", thread_ts=thread_ts)
+            try:
+                os.unlink(local_stp)
+            except Exception:
+                pass
+            return
+
+        if not import_feature:
+            say(text="⚠️ Blob uploaded but Import feature not found — "
+                     "please update it manually in Onshape.",
+                thread_ts=thread_ts)
+        else:
+            ok = oc.update_import_feature(
+                did, branch_id, ps_eid_actual,
+                import_feature["featureId"], blob_eid, new_mv, import_feature
+            )
+            if not ok:
+                say(text="⚠️ Blob uploaded but Import feature update failed. "
+                         "Please update it manually.",
+                    thread_ts=thread_ts)
+
+        version_desc = (
+            f"Update - External Changes - {user_name}: {changelog}"
+            + ("\n⚠️ This part also has native Onshape features — verify geometry interaction."
+               if ps_class == "import_extras" else "")
+        )
+        oc.create_version(did, branch_id, [part_number],
+                          label="Update check in", description=version_desc)
+
+        nc.set_review_required(page_id)
+        db_save_review(thread_ts, channel, part_number, page_id,
+                       stp_file.get("name", ""), branch_url)
+
+        extras_note = (
+            "\n\n⚠️ _This part has native Onshape features — please verify the imported "
+            "geometry interacts correctly._"
+        ) if ps_class == "import_extras" else ""
