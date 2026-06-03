@@ -1301,3 +1301,324 @@ def handle_update(event, say, part_number: str, notion_part: dict,
             "\n\n⚠️ _This part has native Onshape features — please verify the imported "
             "geometry interacts correctly._"
         ) if ps_class == "import_extras" else ""
+
+        say(
+            text=(
+                f"✅ *{part_number} — {part_name}* updated by *{user_name}*."
+                f"{notes_text}"
+                f"\n\U0001f517 Onshape branch ready for review: {branch_url}"
+                f"{extras_note}"
+                f"\n\n\U0001f527 *Mechanical Engineer:* please review and merge the branch to main.\n"
+                f"Once done, reply: `@CAD-BOT done {part_number}`"
+            ),
+            thread_ts=thread_ts,
+        )
+
+    try:
+        os.unlink(local_stp)
+    except Exception:
+        pass
+
+
+# -- Main event handler --------------------------------------------------------
+
+@slack_app.event("app_mention")
+def handle_mention(event, say):
+    channel   = event["channel"]
+    event_ts  = event["ts"]
+    thread_ts = event.get("thread_ts", event_ts)
+    user_id   = event["user"]
+
+    try:
+        slack_app.client.reactions_add(channel=channel, timestamp=event_ts, name="eyes")
+    except Exception:
+        pass
+
+    def _process():
+        try:
+            raw_text  = strip_mentions(event.get("text", ""))
+            user_name, user_email = resolve_user(user_id)
+
+            # -- CHECK: pending update confirmation in this thread ------------
+            pending_upd = db_get_pending_update(thread_ts)
+            if pending_upd:
+                lowered = raw_text.strip().lower()
+                if lowered in ("yes", "y", "proceed", "confirm", "go ahead", "ja"):
+                    db_clear_pending_update(thread_ts)
+                    file_info = json.loads(pending_upd["file_info_json"])
+                    pn        = pending_upd["part_number"]
+                    notes_upd = pending_upd["notes"]
+                    notion_parts = nc.search_part(pn)
+                    if not notion_parts:
+                        say(text=f"⚠️ *{pn}* not found in Notion database.",
+                            thread_ts=thread_ts)
+                        return
+                    handle_update(event, say, pn, notion_parts[0],
+                                  file_info, user_name, notes_upd)
+                else:
+                    say(text="Update cancelled. If you'd like to proceed, "
+                             "start a new `@CAD-BOT update` message.",
+                        thread_ts=thread_ts)
+                    db_clear_pending_update(thread_ts)
+                return
+
+            # -- CHECK: pending disambiguation in this thread -----------------
+            disam = db_get_disambiguation(thread_ts)
+            if disam:
+                candidates = json.loads(disam["candidates_json"])
+                lowered    = raw_text.strip().lower()
+
+                selected = None
+                if re.match(r'^\d+$', lowered):
+                    idx = int(lowered) - 1
+                    if 0 <= idx < len(candidates):
+                        selected = candidates[idx]
+                else:
+                    pn = _extract_part_number(raw_text)
+                    if pn:
+                        selected = next(
+                            (c for c in candidates if c["part_number"].upper() == pn), None
+                        )
+
+                if selected:
+                    db_clear_disambiguation(thread_ts)
+                    notion_parts = nc.search_part(selected["part_number"])
+                    if notion_parts:
+                        handle_checkout(event, say, selected["part_number"],
+                                        selected.get("item_name"), notion_parts[0],
+                                        user_id, user_name, user_email)
+                    else:
+                        say(text=f"⚠️ Could not find *{selected['part_number']}* in the Notion database.",
+                            thread_ts=thread_ts)
+                else:
+                    say(text="I didn't catch that. Please reply with the number of the part "
+                             "you want, e.g. `1` or `M001432`.",
+                        thread_ts=thread_ts)
+                return
+
+            intent = parse_intent(raw_text)
+            action = intent.get("action", "unknown")
+
+            # -- CHECKOUT -----------------------------------------------------
+            if action == "checkout":
+                part_number = intent.get("part_number")
+                description = intent.get("part_description") or intent.get("part_name")
+
+                if part_number:
+                    notion_parts = nc.search_part(part_number)
+                    if not notion_parts:
+                        say(text=f"⚠️ *{part_number}* is not in the Phoenix Check In / Out database. "
+                                 f"Ask your engineer to add it before checking out.",
+                            thread_ts=thread_ts)
+                        return
+                    handle_checkout(event, say, part_number, None, notion_parts[0],
+                                    user_id, user_name, user_email)
+
+                elif description:
+                    say(text=f"\U0001f50d Looking up parts matching _{description}_…",
+                        thread_ts=thread_ts)
+                    matches, confidence = find_matching_parts(description)
+
+                    if not matches:
+                        say(text=f"❌ I couldn't find any parts matching _{description}_. "
+                                 f"Try using the Part# directly (e.g. `checkout M001432`).",
+                            thread_ts=thread_ts)
+                        return
+
+                    if confidence == "high" and len(matches) == 1:
+                        p = matches[0]
+                        notion_parts = nc.search_part(p["part_number"])
+                        if notion_parts:
+                            handle_checkout(event, say, p["part_number"],
+                                            p.get("item_name"), notion_parts[0],
+                                            user_id, user_name, user_email)
+                        return
+
+                    lines = [f"I found {len(matches)} possible match(es) for _{description}_. "
+                             f"Reply with the number to confirm:\n"]
+                    for i, p in enumerate(matches[:5], 1):
+                        module = ", ".join(p.get("part_of_module", []))
+                        lines.append(
+                            f"*{i}.* `{p['part_number']}` — {p['item_name']} "
+                            f"({p.get('item_category', '')} | {module})"
+                        )
+                    say(text="\n".join(lines), thread_ts=thread_ts)
+                    db_save_disambiguation(thread_ts, channel, user_id,
+                                           [{"part_number": p["part_number"],
+                                             "item_name": p["item_name"]}
+                                            for p in matches[:5]],
+                                           raw_text)
+                else:
+                    say(text="I need a part name or number. Try:\n"
+                             "`@CAD-BOT checkout M001432` or\n"
+                             "`@CAD-BOT checkout busbar in phase selector for N`",
+                        thread_ts=thread_ts)
+
+            # -- CHECKIN ------------------------------------------------------
+            elif action == "checkin":
+                context = db_get_thread_context(thread_ts)
+
+                if not context:
+                    explicit_pn = intent.get("part_number")
+
+                    if explicit_pn:
+                        context = db_get_thread_context_by_part(explicit_pn)
+                        if not context:
+                            say(text=f"⚠️ No active checkout found for *{explicit_pn}*. "
+                                     f"Run `@CAD-BOT status` to see what's checked out.",
+                                thread_ts=thread_ts)
+                            return
+                    else:
+                        all_parts = nc.get_all_parts()
+                        user_parts = [p for p in all_parts if p.get("status") == "Checked Out"]
+
+                        if not user_parts:
+                            say(text="⚠️ No parts are currently checked out. "
+                                     "Nothing to check in.",
+                                thread_ts=thread_ts)
+                            return
+
+                        if len(user_parts) == 1:
+                            pn = user_parts[0]["part_number"]
+                            context = db_get_thread_context_by_part(pn)
+                            if not context:
+                                say(text=f"⚠️ Found *{pn}* checked out in Notion but couldn't "
+                                         f"locate the checkout session. "
+                                         f"Please specify: `@CAD-BOT checkin {pn}`",
+                                    thread_ts=thread_ts)
+                                return
+                        else:
+                            lines = ["Multiple parts are currently checked out. "
+                                     "Which one are you checking in? Reply with the Part#:\n"]
+                            for p in user_parts:
+                                lines.append(f"  • `{p['part_number']}` — {p.get('item_name', '')}")
+                            say(text="\n".join(lines), thread_ts=thread_ts)
+                            return
+
+                files    = event.get("files", [])
+                stp_file = next((f for f in files
+                                 if f.get("name", "").lower().endswith((".step", ".stp"))), None)
+                if not stp_file:
+                    say(text="\U0001f4ce Please attach your modified *.step* or *.stp* file to the message.",
+                        thread_ts=thread_ts)
+                    return
+
+                notes = intent.get("notes")
+                handle_checkin(event, say, context, stp_file, user_name, notes)
+
+            # -- UPDATE -------------------------------------------------------
+            elif action == "update":
+                files    = event.get("files", [])
+                stp_file = next((f for f in files
+                                 if f.get("name", "").lower().endswith((".step", ".stp"))), None)
+                if not stp_file:
+                    say(text="\U0001f4ce Please attach a *.step* file to your update message.",
+                        thread_ts=thread_ts)
+                    return
+
+                part_number = intent.get("part_number") or \
+                              _part_number_from_filename(stp_file.get("name", ""))
+                if not part_number:
+                    say(text="⚠️ I couldn't find a Part# in your message or filename. "
+                             "Include the Part# in your message (e.g. `update M001237`) "
+                             "or name your file `M001237 - Part Name.step`.",
+                        thread_ts=thread_ts)
+                    return
+
+                notion_parts = nc.search_part(part_number)
+                if not notion_parts:
+                    say(text=f"⚠️ *{part_number}* is not in the Phoenix Check In / Out "
+                             f"database. Ask your engineer to add it first.",
+                        thread_ts=thread_ts)
+                    return
+
+                notion_part = notion_parts[0]
+                notes = intent.get("notes")
+
+                if notion_part.get("status") == "Checked Out":
+                    say(
+                        text=f"⚠️ *{part_number}* is currently checked out. "
+                             f"Pushing an update now may conflict with the active checkout.\n\n"
+                             f"Reply *yes* in this thread to proceed anyway, "
+                             f"or ignore this message to cancel.",
+                        thread_ts=thread_ts,
+                    )
+                    db_save_pending_update(thread_ts, channel, user_id,
+                                           part_number, stp_file, notes)
+                    return
+
+                handle_update(event, say, part_number, notion_part,
+                              stp_file, user_name, notes)
+
+            # -- DONE (engineer review) ---------------------------------------
+            elif action == "done":
+                part_number = intent.get("part_number")
+                if not part_number:
+                    say(text="Please specify the part number: `@CAD-BOT done M001432`",
+                        thread_ts=thread_ts)
+                    return
+
+                review = db_get_pending_review(part_number)
+                if not review:
+                    say(text=f"⚠️ No pending review found for *{part_number}*.",
+                        thread_ts=thread_ts)
+                    return
+
+                if review["notion_page_id"]:
+                    nc.set_checked_in(review["notion_page_id"])
+
+                db_close_review(part_number)
+
+                say(
+                    text=f"✅ Review for *{part_number}* marked complete.\n"
+                         f"Notion updated → *Checked In*. "
+                         f"Make sure the branch has been merged to main in Onshape.",
+                    thread_ts=thread_ts,
+                )
+
+            # -- STATUS -------------------------------------------------------
+            elif action == "status":
+                all_parts = nc.get_all_parts()
+                active = [p for p in all_parts
+                          if p.get("status") in ("Checked Out", "Review Required")]
+                say(text=format_status(active), thread_ts=thread_ts)
+
+            # -- HELP ---------------------------------------------------------
+            elif action == "help":
+                say(text=HELP_TEXT, thread_ts=thread_ts)
+
+            # -- UNKNOWN ------------------------------------------------------
+            else:
+                say(text="I'm not sure what you mean. Try `@CAD-BOT help`.",
+                    thread_ts=thread_ts)
+
+        except Exception as e:
+            logger.error("Error handling mention: %s", e, exc_info=True)
+            say(text=f"⚠️ Something went wrong: `{e}`", thread_ts=thread_ts)
+        finally:
+            try:
+                slack_app.client.reactions_remove(
+                    channel=channel, timestamp=event_ts, name="eyes"
+                )
+            except Exception:
+                pass
+
+    threading.Thread(target=_process, daemon=True).start()
+
+
+# -- Flask routes --------------------------------------------------------------
+
+@flask_app.route("/slack/events", methods=["POST"])
+def slack_events():
+    return handler.handle(request)
+
+
+@flask_app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok", "onshape_base": oc.BASE_URL}, 200
+
+
+# -- Entry point ---------------------------------------------------------------
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 3000))
+    flask_app.run(host="0.0.0.0", port=port)
