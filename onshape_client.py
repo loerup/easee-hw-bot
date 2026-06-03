@@ -616,6 +616,30 @@ def create_branch(did: str, version_id: str, part_numbers: list[str]) -> str | N
         return None
 
 
+# ── 5b. Create update branch ──────────────────────────────────────────────────
+def create_update_branch(did: str, version_id: str, part_numbers: list[str]) -> str | None:
+    """
+    Create a branch named 'Update - Agent' from a version.
+    Used by the update command (designer pushes geometry without a checkout).
+    Returns the new workspace (branch) ID or None on failure.
+    """
+    parts_str = ", ".join(part_numbers)
+    body = {
+        "name":          "Update - Agent",
+        "description":   f"Update submitted by agent. Part(s): {parts_str}",
+        "fromVersionId": version_id,
+        "isReadOnly":    False,
+    }
+    resp = _request("POST", f"/api/v6/documents/d/{did}/workspaces", body=body)
+    if resp.status_code in (200, 201):
+        branch_id = resp.json().get("id")
+        print(f"✅ Update branch created: 'Update - Agent' (id: {branch_id})")
+        return branch_id
+    else:
+        print(f"❌ Update branch creation failed: {resp.status_code} — {resp.text[:300]}")
+        return None
+
+
 # ── 6. Update blob element with new .stp file ────────────────────────────────
 def update_blob_element(did: str, wid: str, blob_eid: str, stp_path: str) -> str | None:
     """
@@ -780,7 +804,7 @@ def update_import_feature(did: str, wid: str, eid: str, feature_id: str,
         return False
 
 
-# ── Clean filename ─────────────────────────────────────────────────────────────
+# ── Clean filename ─────────────────────────────────────────────────────────────────────────────
 def clean_filename(raw_name: str) -> str:
     """
     Normalise Onshape auto-generated export names to 'Part# - Name' convention.
