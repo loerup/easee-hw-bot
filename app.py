@@ -8,8 +8,8 @@ the Phoenix Check In / Out Notion database.
 Trigger: @CAD-BOT <command>
 
 Commands:
-  checkout <part name/number>   — find part in Onshape, export .stp, share in thread
-  checkin  [notes]              — return modified .stp (attach file); attach .stp anywhere in channel
+  checkout <part name/number>   — find part in Onshape, export .step, share in thread
+  checkin  [notes]              — return modified .step (attach file); attach .step anywhere in channel
   done <part number>            — [Engineer] mark configured-part review complete
   status                        — show all currently checked-out parts (from Notion)
   help                          — explain the workflow
@@ -473,13 +473,13 @@ def strip_mentions(text: str) -> str:
 
 def upload_stp_to_slack(channel: str, thread_ts: str, stp_path: str,
                          part_number: str, part_name: str):
-    """Upload a .stp file to a Slack thread."""
+    """Upload a .step file to a Slack thread."""
     try:
         slack_app.client.files_upload_v2(
             channel=channel,
             thread_ts=thread_ts,
             file=stp_path,
-            filename=f"{part_number} - {part_name}.stp",
+            filename=f"{part_number} - {part_name}.step",
             title=f"{part_number} - {part_name}",
         )
     except Exception as e:
@@ -490,13 +490,13 @@ def upload_stp_to_slack(channel: str, thread_ts: str, stp_path: str,
 def download_slack_file(file_info: dict) -> str:
     """Download a Slack file to a temp path. Returns the local path."""
     url   = file_info.get("url_private_download") or file_info.get("url_private")
-    name  = file_info.get("name", "upload.stp")
+    name  = file_info.get("name", "upload.step")
     token = os.environ["SLACK_BOT_TOKEN"]
 
     resp = requests.get(url, headers={"Authorization": f"Bearer {token}"})
     resp.raise_for_status()
 
-    suffix = os.path.splitext(name)[1] or ".stp"
+    suffix = os.path.splitext(name)[1] or ".step"
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
     tmp.write(resp.content)
     tmp.close()
@@ -511,9 +511,9 @@ I handle the full CAD handoff between *Onshape* (Engineering) and *Fusion 360* (
 
 *Commands:*
 • `@CAD-BOT checkout <part name or number>`
-  → I find the part in Onshape, create a checkout branch, export the .stp, and share it here.
+  → I find the part in Onshape, create a checkout branch, export the .step, and share it here.
 
-• `@CAD-BOT checkin [notes]` _(attach the modified .stp — works from any message in this channel)_
+• `@CAD-BOT checkin [notes]` _(attach the modified .step — works from any message in this channel)_
   → I upload your file back into Onshape and notify Engineering to review.
   → If multiple parts are checked out, add the Part# e.g. `checkin M001432 [notes]`
 
@@ -527,7 +527,7 @@ I handle the full CAD handoff between *Onshape* (Engineering) and *Fusion 360* (
   → This message.
 
 *Workflow:*
-1️⃣  `checkout` the part → I share the .stp in this thread
+1️⃣  `checkout` the part → I share the .step in this thread
 2️⃣  Edit in Fusion 360
 3️⃣  `@CAD-BOT checkin` anywhere in this channel with your modified file attached
 4️⃣  Engineering reviews and merges the branch in Onshape"""
@@ -598,7 +598,7 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
     1. Verify not already checked out
     2. Search Onshape for Part#
     3. Create BOT### version + branch
-    4. Export .stp
+    4. Export .step
     5. Upload to Slack thread
     6. Update Notion → Checked Out
     7. Save thread context
@@ -656,10 +656,10 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
 
     branch_url = f"https://easee.onshape.com/documents/{did}/w/{branch_id}"
 
-    # ④ Export .stp
-    say(text="📦 Exporting .stp file (this can take 1–3 minutes)…", thread_ts=thread_ts)
+    # ④ Export .step
+    say(text="📦 Exporting .step file (this can take 1–3 minutes)…", thread_ts=thread_ts)
     clean_name = oc.clean_filename(part.get("partName", part_number))
-    stp_path   = f"/tmp/{clean_name.replace(' ', '_')}.stp"
+    stp_path   = f"/tmp/{clean_name.replace(' ', '_')}.step"
 
     success = oc.export_step(did, branch_id, eid, part_id, stp_path, configuration)
     if not success:
@@ -668,7 +668,7 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
         return
 
     # ⑤ Upload to Slack
-    say(text=f"⬆️ Uploading .stp to thread…", thread_ts=thread_ts)
+    say(text=f"⬆️ Uploading .step to thread…", thread_ts=thread_ts)
     try:
         upload_stp_to_slack(channel, thread_ts, stp_path, part_number, part_name)
     except Exception as e:
@@ -718,7 +718,7 @@ def handle_checkout(event, say, part_number: str, part_name_hint: str | None,
              f"{config_msg}"
              f"\n🔗 Onshape branch: {branch_url}"
              f"\n\nWhen you're done, reply in *this thread* with "
-             f"`@CAD-BOT checkin` and attach your modified .stp file.",
+             f"`@CAD-BOT checkin` and attach your modified .step file.",
         thread_ts=thread_ts,
     )
     try:
@@ -735,7 +735,7 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
     Three paths based on Part Studio feature composition:
       A. import_only    — update existing blob + Import feature → Checked In
       B. import_extras  — same as A, but warn engineer that native features exist
-      C. native         — no Import feature; upload .stp as new blob → Review Required
+      C. native         — no Import feature; upload .step as new blob → Review Required
 
     Within path A/B, a "safe" sub-path is used when the blob is shared across
     multiple Import features (configured parts) — uploads a new blob instead of
@@ -812,7 +812,7 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
     # ══ PATH C: Native Onshape geometry — no Import feature ══════════════════
     if ps_class == "native":
         say(text=f"ℹ️ *{part_number}* is modelled natively in Onshape (no Import feature). "
-                 f"Uploading your .stp as a reference blob for engineer review…",
+                 f"Uploading your .step as a reference blob for engineer review…",
             thread_ts=thread_ts)
 
         new_blob_name = f"{part_number}_external_reference.step"
@@ -827,7 +827,7 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
 
         version_desc = (
             f"Changelog - External Changes - {user_name}: {changelog}\n"
-            f"⚠️ Native part — external .stp '{new_blob_name}' uploaded as reference. "
+            f"⚠️ Native part — external .step '{new_blob_name}' uploaded as reference. "
             f"Engineer must manually integrate geometry into the Part Studio."
         )
         oc.create_version(did, branch_id, [part_number],
@@ -841,11 +841,11 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
         say(
             text=f"⚠️ *Review required — native Onshape part*\n"
                  f"*{part_number}* is modelled directly in Onshape, not via an Import feature.\n"
-                 f"Your .stp has been uploaded as `{new_blob_name}` on the branch.\n"
+                 f"Your .step has been uploaded as `{new_blob_name}` on the branch.\n"
                  f"🔗 {branch_url}\n\n"
                  f"A *Mechanical Engineer* must:\n"
                  f"1. Open the branch in Onshape\n"
-                 f"2. Review the external .stp geometry\n"
+                 f"2. Review the external .step geometry\n"
                  f"3. Manually update or replace the native model as appropriate\n"
                  f"4. Merge the branch to main\n\n"
                  f"Once done, reply: `@CAD-BOT done {part_number}`",
@@ -1151,9 +1151,9 @@ def handle_mention(event, say):
 
                 files    = event.get("files", [])
                 stp_file = next((f for f in files
-                                 if f.get("name", "").lower().endswith((".stp", ".step"))), None)
+                                 if f.get("name", "").lower().endswith((".step", ".stp"))), None)
                 if not stp_file:
-                    say(text="📎 Please attach your modified *.stp* or *.step* file to the message.",
+                    say(text="📎 Please attach your modified *.step* or *.stp* file to the message.",
                         thread_ts=thread_ts)
                     return
 
@@ -1233,3 +1233,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     flask_app.run(host="0.0.0.0", port=port)
+0.0.0.0", port=port)
