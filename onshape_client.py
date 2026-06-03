@@ -284,7 +284,7 @@ def search_by_part_number(part_number: str, hint: str = "") -> list[dict]:
         "documentFilter": 7,
     }
     try:
-        resp = _request("POST", "/api/v6/documents/search", json=payload)
+        resp = _request("POST", "/api/v6/documents/search", body=payload)
         if resp.status_code != 200:
             logger.warning("Global search returned %s — falling back to scan", resp.status_code)
             return _scan_workspace_for_part(part_number)
