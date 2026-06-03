@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 import requests
 from slack_bolt import App
 from slack_bolt.adapter.flask import SlackRequestHandler
-from flask import Flask, request as flask_request
+from flask import Flask, request
 from anthropic import AnthropicBedrock
 
 import onshape_client as oc
@@ -1221,7 +1221,7 @@ def handle_mention(event, say):
 
 @flask_app.route("/slack/events", methods=["POST"])
 def slack_events():
-    return handler.handle(flask_request)
+    return handler.handle(request)
 
 
 @flask_app.route("/health", methods=["GET"])
@@ -1233,4 +1233,3 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 3000))
     flask_app.run(host="0.0.0.0", port=port)
-0.0.0.0", port=port)
