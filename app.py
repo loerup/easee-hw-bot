@@ -274,7 +274,7 @@ Extract the user's intent and return ONLY valid JSON — no explanation, no mark
 
 JSON schema:
 {
-  "action": "checkout" | "checkin" | "update" | "status" | "help" | "done" | "unknown",
+  "action": "checkout" | "checkin" | "update" | "download" | "status" | "help" | "done" | "unknown",
   "part_description": string | null,
   "part_number": string | null,
   "notes": string | null
@@ -286,6 +286,7 @@ Rules:
 - action = "status" when user asks what is checked out / currently in use / who has what
 - action = "help" when user asks how to use the bot or what commands exist
 - action = "update" when a designer wants to push a new .step file to Onshape without a full checkout cycle (e.g. "update", "update M001432", "push new geometry")
+- action = "download" when a user wants to download/get the latest .step for a part without checking it out (e.g. "download M001432", "get the step file for", "just download")
 - action = "done" when a Mechanical Engineer says a review is complete (e.g. "done M001432", "done reviewing M001432", "review complete for M001432")
 - part_number: extract if it looks like a product code starting with M followed by digits (e.g. M001432, M001505)
 - part_description: the user's natural language description of the part if no clear part_number
@@ -329,6 +330,16 @@ def parse_intent(text: str) -> dict:
 
     if lowered in ("update", "push"):
         return {"action": "update", "part_number": None, "notes": None}
+
+    for prefix in ("download ", "get "):
+        if lowered.startswith(prefix):
+            rest = text[len(prefix):].strip()
+            pn = _extract_part_number(rest)
+            return {"action": "download", "part_number": pn,
+                    "part_description": None if pn else rest}
+
+    if lowered in ("download",):
+        return {"action": "download", "part_number": None, "part_description": None}
 
     # "done M######"
     done_match = re.match(r'^done\s+(M\d+)', text, re.IGNORECASE)
@@ -579,6 +590,10 @@ I handle the full CAD handoff between *Onshape* (Engineering) and *Fusion 360* (
 • `@CAD-BOT update [part number] [notes]` _(attach a .step file)_
   → Push new geometry directly without a checkout. Bot creates a branch and notifies Engineering to review.
   → Part# can be in the message or in the filename (e.g. `M001237 - Display Casing.step`).
+
+• `@CAD-BOT download <part name or number>`
+  → Download the latest .step from Onshape main — no checkout, no Notion update, no branch created.
+  → If the part is currently checked out, a courtesy warning is shown.
 
 • `@CAD-BOT done <part number>` _(Mechanical Engineers only)_
   → Marks a review as complete in Notion after merging the branch in Onshape.
@@ -1320,6 +1335,80 @@ def handle_update(event, say, part_number: str, notion_part: dict,
         pass
 
 
+
+def handle_download(event, say, part_number: str, notion_part: dict | None,
+                    user_name: str):
+    """
+    Download flow — export latest .step from Onshape main with no side effects.
+
+    No version, no branch, no Notion update, no thread context saved.
+    Exports directly from the main workspace so it is faster than checkout.
+    """
+    channel   = event["channel"]
+    event_ts  = event["ts"]
+    thread_ts = event.get("thread_ts", event_ts)
+
+    part_name = (notion_part.get("item_name") if notion_part else None) or part_number
+
+    # Courtesy warning if already checked out
+    if notion_part and notion_part.get("status") == "Checked Out":
+        say(text=f"ℹ️ *{part_number}* is currently checked out. "
+                 f"You will get the last version from main (before the active checkout).",
+            thread_ts=thread_ts)
+
+    say(text=f"🔍 Found *{part_number} — {part_name}*. Searching Onshape…",
+        thread_ts=thread_ts)
+
+    matches = oc.search_by_part_number(part_number)
+    if not matches:
+        say(text=f"❌ Could not find *{part_number}* in Onshape. Check the Part# and try again.",
+            thread_ts=thread_ts)
+        return
+    part = matches[0]
+
+    did           = part["documentId"]
+    wid           = part["workspaceId"]   # main workspace — no branch needed
+    eid           = part["elementId"]
+    part_id       = part["partId"]
+    configuration = part.get("configuration", "")
+    is_configured = part.get("is_configured", False)
+
+    config_note = f" _(config: {configuration})_" if is_configured else ""
+    say(text=f"✅ Found in Onshape: *{part['documentName']}*{config_note}\n"
+             f"Exporting .step from main (this can take 1–3 minutes)…",
+        thread_ts=thread_ts)
+
+    clean_name = oc.clean_filename(part.get("partName", part_number))
+    stp_path   = f"/tmp/{clean_name.replace(' ', '_')}_download.step"
+
+    success = oc.export_step(did, wid, eid, part_id, stp_path, configuration)
+    if not success:
+        say(text="❌ STEP export failed. Please export manually from Onshape.",
+            thread_ts=thread_ts)
+        return
+
+    try:
+        slack_app.client.files_upload_v2(
+            channel=channel,
+            thread_ts=thread_ts,
+            file=stp_path,
+            filename=f"{part_number} - {part_name}.step",
+            title=f"{part_number} - {part_name}",
+        )
+    except Exception as e:
+        say(text=f"⚠️ File upload failed: `{e}`", thread_ts=thread_ts)
+        return
+
+    say(text=f"📦 *{part_number} — {part_name}* — latest .step from main.\n"
+             f"_(No checkout created — this file is for reference only.)_",
+        thread_ts=thread_ts)
+
+    try:
+        os.unlink(stp_path)
+    except Exception:
+        pass
+
+
 # -- Main event handler --------------------------------------------------------
 
 @slack_app.event("app_mention")
@@ -1383,7 +1472,12 @@ def handle_mention(event, say):
                 if selected:
                     db_clear_disambiguation(thread_ts)
                     notion_parts = nc.search_part(selected["part_number"])
-                    if notion_parts:
+                    pending_action = selected.get("action", "checkout")
+                    if pending_action == "download":
+                        handle_download(event, say, selected["part_number"],
+                                        notion_parts[0] if notion_parts else None,
+                                        user_name)
+                    elif notion_parts:
                         handle_checkout(event, say, selected["part_number"],
                                         selected.get("item_name"), notion_parts[0],
                                         user_id, user_name, user_email)
@@ -1575,6 +1669,55 @@ def handle_mention(event, say):
                          f"Make sure the branch has been merged to main in Onshape.",
                     thread_ts=thread_ts,
                 )
+
+            # -- DOWNLOAD ----------------------------------------------------
+            elif action == "download":
+                part_number = intent.get("part_number")
+                description = intent.get("part_description")
+
+                if part_number:
+                    notion_parts = nc.search_part(part_number)
+                    notion_part  = notion_parts[0] if notion_parts else None
+                    handle_download(event, say, part_number, notion_part, user_name)
+
+                elif description:
+                    say(text=f"\U0001f50d Looking up parts matching _{description}_\u2026",
+                        thread_ts=thread_ts)
+                    matches, confidence = find_matching_parts(description)
+
+                    if not matches:
+                        say(text=f"\u274c I couldn't find any parts matching _{description}_. "
+                                 f"Try using the Part# directly (e.g. `download M001432`).",
+                            thread_ts=thread_ts)
+                        return
+
+                    if confidence == "high" and len(matches) == 1:
+                        p = matches[0]
+                        notion_parts = nc.search_part(p["part_number"])
+                        handle_download(event, say, p["part_number"],
+                                        notion_parts[0] if notion_parts else None,
+                                        user_name)
+                        return
+
+                    lines = [f"I found {len(matches)} possible match(es) for _{description}_. Reply with the number to download:\n"]
+                    for i, p in enumerate(matches[:5], 1):
+                        module = ", ".join(p.get("part_of_module", []))
+                        lines.append(
+                            f"*{i}.* `{p['part_number']}` \u2014 {p['item_name']} "
+                            f"({p.get('item_category', '')} | {module})"
+                        )
+                    say(text="\n".join(lines), thread_ts=thread_ts)
+                    db_save_disambiguation(thread_ts, channel, user_id,
+                                           [{"part_number": p["part_number"],
+                                             "item_name":   p["item_name"],
+                                             "action":      "download"}
+                                            for p in matches[:5]],
+                                           raw_text)
+                else:
+                    say(text="I need a part name or number. Try:\n"
+                             "`@CAD-BOT download M001432` or\n"
+                             "`@CAD-BOT download harvest clip`",
+                        thread_ts=thread_ts)
 
             # -- STATUS -------------------------------------------------------
             elif action == "status":
