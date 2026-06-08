@@ -844,19 +844,23 @@ def handle_checkin(event, say, context: sqlite3.Row, stp_file: dict,
         say(text=f"❌ Could not download your file: `{e}`", thread_ts=thread_ts)
         return
 
-    # ② Find the Part Studio EID in the branch
-    elements = oc._get_elements(did, branch_id)
+    # ② Find the Part Studio that owns this part's blob element.
+    # Name-prefix matching ("m001") is unreliable for documents with multiple Part Studios
+    # (e.g. M001405 and M001408 in the same document both match "m001").
     ps_eid_actual = None
-    for elem in elements:
-        etype = (elem.get("type") or "").replace(" ", "").upper()
-        ename = elem.get("name") or ""
-        if etype == "PARTSTUDIO" and part_number[:4].lower() in ename.lower():
-            ps_eid_actual = elem["id"]
-            break
+    if blob_eid:
+        ps_eid_actual = oc.find_part_studio_for_blob(did, branch_id, blob_eid)
+        if ps_eid_actual:
+            logger.info("Found Part Studio %s via blob_eid lookup for %s", ps_eid_actual, part_number)
     if not ps_eid_actual:
+        # Fallback: match by full part number in element name
+        elements = oc._get_elements(did, branch_id)
         for elem in elements:
-            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
+            etype = (elem.get("type") or "").replace(" ", "").upper()
+            ename = elem.get("name") or ""
+            if etype == "PARTSTUDIO" and part_number.lower() in ename.lower():
                 ps_eid_actual = elem["id"]
+                logger.info("Found Part Studio %s via name match for %s", ps_eid_actual, part_number)
                 break
 
     if not ps_eid_actual:
@@ -1128,23 +1132,14 @@ def handle_update(event, say, part_number: str, notion_part: dict,
         say(text=f"❌ Could not download your file: `{e}`", thread_ts=thread_ts)
         return
 
-    # ⑤ Find Part Studio EID in the branch
-    elements = oc._get_elements(did, branch_id)
-    ps_eid_actual = None
-    for elem in elements:
-        etype = (elem.get("type") or "").replace(" ", "").upper()
-        ename = elem.get("name") or ""
-        if etype == "PARTSTUDIO" and part_number[:4].lower() in ename.lower():
-            ps_eid_actual = elem["id"]
-            break
-    if not ps_eid_actual:
-        for elem in elements:
-            if (elem.get("type") or "").replace(" ", "").upper() == "PARTSTUDIO":
-                ps_eid_actual = elem["id"]
-                break
+    # ⑤ The element ID from global search is stable across branches — use it directly.
+    # Re-scanning by name prefix ("m001") was unreliable for documents with multiple
+    # Part Studios (e.g. M001405 and M001408 in the same document both match "m001").
+    ps_eid_actual = eid   # eid = part["elementId"] from global search result
+    logger.info("Update: using Part Studio eid %s for %s (from search result)", ps_eid_actual, part_number)
 
     if not ps_eid_actual:
-        say(text="❌ Could not find the Part Studio in the update branch.", thread_ts=thread_ts)
+        say(text="❌ Could not resolve Part Studio element for the update branch.", thread_ts=thread_ts)
         try:
             os.unlink(local_stp)
         except Exception:
@@ -1217,8 +1212,11 @@ def handle_update(event, say, part_number: str, notion_part: dict,
 
     # ══ PATH A / B: Part has an Import feature ═════════════════════════════════
 
-    # Resolve the Import feature and blob EID
-    part_feature_id = part.get("featureId", "")
+    # Resolve the Import feature and blob EID.
+    # Global search does not return featureId, so look it up via partId.
+    part_feature_id = part.get("featureId", "") or oc.get_feature_id_for_part(
+        did, branch_id, ps_eid_actual, part_id
+    )
     import_feature, blob_eid = oc.find_import_and_blob_for_part(
         did, branch_id, ps_eid_actual, part_feature_id
     )
