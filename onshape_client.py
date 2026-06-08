@@ -804,6 +804,63 @@ def update_import_feature(did: str, wid: str, eid: str, feature_id: str,
         return False
 
 
+# ── Find Part Studio by blob element ID ───────────────────────────────────────────────────────────
+def find_part_studio_for_blob(did: str, wid: str, blob_eid: str) -> str | None:
+    """
+    Return the Part Studio element ID whose Import feature references blob_eid.
+
+    Used during check-in when we know the blob element ID (stored in thread_context)
+    but not which Part Studio contains it — critical for documents that have multiple
+    Part Studios (e.g. M001405 and M001408 in the same Onshape document).
+    """
+    elements = _get_elements(did, wid)
+    for elem in elements:
+        if (elem.get("type") or "").replace(" ", "").upper() != "PARTSTUDIO":
+            continue
+        eid = elem["id"]
+        resp = _request("GET", f"/api/v6/partstudios/d/{did}/w/{wid}/e/{eid}/features")
+        if resp.status_code != 200:
+            continue
+        features = resp.json().get("features", [])
+        for f in features:
+            if (f.get("featureType") or "").lower() not in ("import", "importforeign"):
+                continue
+            for param in f.get("parameters", []):
+                if param.get("parameterId") == "blobData":
+                    ns = param.get("namespace", "")
+                    if blob_eid in ns:
+                        logger.info("find_part_studio_for_blob: found Part Studio %s for blob %s", eid, blob_eid)
+                        return eid
+    logger.warning("find_part_studio_for_blob: no Part Studio found for blob %s", blob_eid)
+    return None
+
+
+# ── Get feature ID for a specific part ────────────────────────────────────────────────────────────
+def get_feature_id_for_part(did: str, wid: str, eid: str, part_id: str) -> str:
+    """
+    Return the featureId of the feature that defines a specific part in a Part Studio.
+
+    The global search API does not return featureId. By querying the parts endpoint we
+    can look up the featureId for a given partId and use it to unambiguously match the
+    correct Import feature in find_import_and_blob_for_part — essential when a Part
+    Studio contains multiple parts each with their own Import feature.
+    """
+    if not part_id:
+        return ""
+    resp = _request("GET", f"/api/v6/parts/d/{did}/w/{wid}/e/{eid}")
+    if resp.status_code != 200:
+        logger.warning("get_feature_id_for_part: parts API returned %s", resp.status_code)
+        return ""
+    for part in resp.json():
+        if part.get("partId") == part_id:
+            fid = part.get("featureId") or ""
+            if fid:
+                logger.info("get_feature_id_for_part: resolved featureId %s for partId %s", fid, part_id)
+            return fid
+    logger.warning("get_feature_id_for_part: partId %s not found in Part Studio %s", part_id, eid)
+    return ""
+
+
 # ── Clean filename ─────────────────────────────────────────────────────────────────────────────
 def clean_filename(raw_name: str) -> str:
     """
